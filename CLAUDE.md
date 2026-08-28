@@ -23,3 +23,14 @@
 - **权限模型**：`src-tauri/capabilities/default.json` 声明窗口（`main`）和插件权限。新增插件或系统能力时需在此添加对应权限，否则运行时会被拒。
 - **Vite 配置**：dev server 端口固定 1420（HMR 用 1421），`vite.config.ts` 已配置忽略监听 `src-tauri`，前端热更新不触发 Rust 重编译。
 - **桌面配置**：窗口标题、尺寸、图标、bundle 目标都在 `src-tauri/tauri.conf.json`；productName 与 `identifier` 均来自此文件。
+
+
+## vue 组件创建
+
+使用 `bun run plop` 命令创建 Vue 组件，模板位于 `plop-templates/component.hbs`。
+
+示例：
+
+```
+npm run generate -- component --name TopTwo --dir src/components
+```
