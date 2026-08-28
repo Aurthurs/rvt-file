@@ -1,0 +1,41 @@
+/* 设计 Token：青绿 + 淡蓝 清新风格
+   与 src/theme.ts 中 Naive UI 主题覆盖保持一致，改品牌色时两端同步 */
+:root {
+  /* 品牌色 */
+  --brand: #10b981;
+  --brand-hover: #34d399;
+  --brand-soft: rgba(16, 185, 129, 0.12);
+  --brand-gradient: linear-gradient(120deg, #0ea5a0 0%, #10b981 45%, #38bdf8 100%);
+
+  /* 背景与表面 */
+  --bg: #f5f9ff;
+  --surface: #ffffff;
+  --border: #e2e8f0;
+
+  /* 文本 */
+  --text: #0f172a;
+  --text-muted: #64748b;
+
+  /* 圆角 */
+  --radius-lg: 16px;
+  --radius-md: 12px;
+  --radius-sm: 8px;
+
+  /* 阴影 */
+  --shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.12);
+  --shadow-brand: 0 12px 30px rgba(16, 185, 129, 0.25);
+}
+
+[data-theme="dark"] {
+  --brand: #34d399;
+  --brand-hover: #6ee7b7;
+  --brand-soft: rgba(52, 211, 153, 0.16);
+  --bg: #0f172a;
+  --surface: #1e293b;
+  --border: #334155;
+  --text: #e2e8f0;
+  --text-muted: #94a3b8;
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5);
+}

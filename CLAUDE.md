@@ -27,10 +27,10 @@
 
 ## vue 组件创建
 
-使用 `bun run plop` 命令创建 Vue 组件，模板位于 `plop-templates/component.hbs`。
+使用 `bun run generate` 创建 Vue 组件，模板位于 `plop-templates/component.hbs`。
 
 示例：
 
 ```
-npm run generate -- component --name TopTwo --dir src/components
+bun run generate -- component --name TopTwo --dir src/components
 ```
