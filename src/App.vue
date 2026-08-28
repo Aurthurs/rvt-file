@@ -1,5 +1,7 @@
 <template>
   <n-config-provider
+    :locale="zhCN"
+    :date-locale="dateZhCN"
     :theme="isDark ? darkTheme : null"
     :theme-overrides="isDark ? darkThemeOverrides : lightThemeOverrides"
   >
@@ -16,7 +18,7 @@
 
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import { darkTheme, useOsTheme } from "naive-ui";
+import { darkTheme, dateZhCN, useOsTheme, zhCN } from "naive-ui";
 import AppSidebar from "@components/layout/AppSidebar.vue";
 import { darkThemeOverrides, lightThemeOverrides } from "@styles/theme";
 

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useRouter } from "vue-router";
 import {
+  ArchiveOutline,
   EyeOutline,
   GitMergeOutline,
   ShieldCheckmarkOutline,
@@ -26,6 +27,12 @@ const cards = [
     desc: "检查文件完整性与质量",
     icon: ShieldCheckmarkOutline,
     to: "/files/quality",
+  },
+  {
+    title: "缓存管理",
+    desc: "管理本地缓存文件与文件夹",
+    icon: ArchiveOutline,
+    to: "/files/cache",
   },
 ];
 </script>
@@ -78,7 +85,7 @@ const cards = [
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 16px;
 }
 

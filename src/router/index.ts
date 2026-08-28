@@ -28,6 +28,11 @@ const router = createRouter({
       name: "files-quality",
       component: () => import("@views/files/QualityCheck.vue"),
     },
+    {
+      path: "/files/cache",
+      name: "files-cache",
+      component: () => import("@views/files/CacheManage.vue"),
+    },
   ],
 });
 

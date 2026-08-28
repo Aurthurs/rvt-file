@@ -12,20 +12,18 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AppSidebar: typeof import('./../components/layout/AppSidebar.vue')['default']
-    Favorites: typeof import('./../components/files/Favorites.vue')['default']
-    FileCard: typeof import('./../components/files/FileCard.vue')['default']
     NButton: typeof import('naive-ui')['NButton']
     NConfigProvider: typeof import('naive-ui')['NConfigProvider']
+    NDataTable: typeof import('naive-ui')['NDataTable']
     NEmpty: typeof import('naive-ui')['NEmpty']
     NIcon: typeof import('naive-ui')['NIcon']
+    NInput: typeof import('naive-ui')['NInput']
     NMessageProvider: typeof import('naive-ui')['NMessageProvider']
-    NProgress: typeof import('naive-ui')['NProgress']
+    NSelect: typeof import('naive-ui')['NSelect']
+    NSpin: typeof import('naive-ui')['NSpin']
     QuickActions: typeof import('./../components/dashboard/QuickActions.vue')['default']
-    RecentFiles: typeof import('./../components/files/RecentFiles.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
-    StorageCard: typeof import('./../components/files/StorageCard.vue')['default']
-    Trash: typeof import('./../components/files/Trash.vue')['default']
     WelcomeBanner: typeof import('./../components/dashboard/WelcomeBanner.vue')['default']
   }
 }

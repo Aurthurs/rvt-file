@@ -9,6 +9,10 @@ export const lightThemeOverrides: GlobalThemeOverrides = {
     primaryColorSuppl: "#34d399",
     borderRadius: "12px",
   },
+  DataTable: {
+    thTextColorWeight: "700",
+    thColor: "rgba(15, 23, 42, 0.04)",
+  },
 };
 
 /** 暗色模式用提亮变体，保证对比度 */
@@ -19,5 +23,9 @@ export const darkThemeOverrides: GlobalThemeOverrides = {
     primaryColorPressed: "#10b981",
     primaryColorSuppl: "#6ee7b7",
     borderRadius: "12px",
+  },
+  DataTable: {
+    thTextColorWeight: "700",
+    thColor: "rgba(255, 255, 255, 0.04)",
   },
 };
