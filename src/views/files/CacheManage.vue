@@ -264,6 +264,7 @@ onMounted(refresh);
         </n-popconfirm>
         <n-dropdown
           :options="exportOptions"
+          :disabled="!checkedKeys.length"
           @select="(k) => onExport(k as string)"
         >
           <n-button :disabled="!checkedKeys.length">批量导出</n-button>

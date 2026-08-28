@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "rvt-file",
+        "title": "RVT",
         "width": 800,
         "height": 600
       }

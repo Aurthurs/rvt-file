@@ -799,11 +799,144 @@ pub fn export_files(req: ExportRequest) -> Result<ExportResult, String> {
     })
 }
 
+/// 质量检测请求
+#[derive(Deserialize)]
+pub struct QualityRequest {
+    pub key: String,
+}
+
+/// 单个字段的质量统计
+#[derive(Serialize)]
+pub struct FieldQuality {
+    pub name: String,
+    pub total: usize,
+    pub non_null: usize,
+    pub null_rate: f64,
+    pub unique: usize,
+    pub duplicates: usize,
+    pub min: Option<String>,
+    pub max: Option<String>,
+    pub avg_len: f64,
+    pub max_len: usize,
+}
+
+/// 数值感知的字符串比较：两端都可解析为数字时按数值比较，否则按字符串
+fn str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
+}
+
+/// 扫描数据，对每个字段做质量检查与统计
+#[tauri::command]
+pub fn scan_quality(req: QualityRequest) -> Result<Vec<FieldQuality>, String> {
+    let (columns, rows) = read_table_full(&req.key)?;
+    let total = rows.len();
+    let mut results = Vec::new();
+
+    for (ci, col) in columns.iter().enumerate() {
+        let mut non_null = 0usize;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut total_len = 0usize;
+        let mut max_len = 0usize;
+        let mut min_val: Option<String> = None;
+        let mut max_val: Option<String> = None;
+
+        for row in &rows {
+            let v = row.get(ci).cloned().unwrap_or(Value::Null);
+            if let Value::String(s) = v {
+                non_null += 1;
+                let len = s.chars().count();
+                total_len += len;
+                if len > max_len {
+                    max_len = len;
+                }
+                seen.insert(s.clone());
+                if let Some(m) = &min_val {
+                    if str_cmp(&s, m) == std::cmp::Ordering::Less {
+                        min_val = Some(s.clone());
+                    }
+                } else {
+                    min_val = Some(s.clone());
+                }
+                if let Some(m) = &max_val {
+                    if str_cmp(&s, m) == std::cmp::Ordering::Greater {
+                        max_val = Some(s.clone());
+                    }
+                } else {
+                    max_val = Some(s.clone());
+                }
+            }
+        }
+
+        let null_rate = if total > 0 {
+            (total - non_null) as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        let avg_len = if non_null > 0 {
+            total_len as f64 / non_null as f64
+        } else {
+            0.0
+        };
+        let duplicates = non_null.saturating_sub(seen.len());
+
+        results.push(FieldQuality {
+            name: col.clone(),
+            total,
+            non_null,
+            null_rate,
+            unique: seen.len(),
+            duplicates,
+            min: min_val,
+            max: max_val,
+            avg_len,
+            max_len,
+        });
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
     use std::io::Write;
+
+    /// 质量检测：统计每个字段的非空、空值率、唯一值、极值
+    #[test]
+    fn scan_quality_works() {
+        let tmp = std::env::temp_dir().join("rvt_scan.csv");
+        let mut f = File::create(&tmp).unwrap();
+        f.write_all(b"name,age\nAlice,25\nBob,30\nCharlie,\n").unwrap();
+        import_file(tmp.to_string_lossy().to_string()).unwrap();
+
+        let res = scan_quality(QualityRequest {
+            key: "rvt_scan.parquet".to_string(),
+        })
+        .unwrap();
+        assert_eq!(res.len(), 2);
+
+        let name = res.iter().find(|f| f.name == "name").unwrap();
+        assert_eq!(name.total, 3);
+        assert_eq!(name.non_null, 3);
+        assert_eq!(name.null_rate, 0.0);
+        assert_eq!(name.unique, 3);
+        assert_eq!(name.duplicates, 0);
+        assert_eq!(name.avg_len, 5.0); // Alice(5)+Bob(3)+Charlie(7) / 3
+        assert_eq!(name.max_len, 7);
+        assert!(name.min.is_some());
+
+        let age = res.iter().find(|f| f.name == "age").unwrap();
+        assert_eq!(age.total, 3);
+        assert_eq!(age.non_null, 2);
+        assert!(age.null_rate > 30.0, "age 空值率应 >30%，实际 {}", age.null_rate);
+        assert_eq!(age.max_len, 2); // "25" / "30" 长度均为 2
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(data_dir().unwrap().join("rvt_scan.parquet"));
+    }
 
     /// 导出功能：批量导出 csv + 合并导出 xlsx
     #[test]
