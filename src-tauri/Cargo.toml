@@ -27,4 +27,5 @@ parquet = "37"
 calamine = "0.36.1"
 csv = "1.4.0"
 tauri-plugin-dialog = "2"
+rust_xlsxwriter = "0.99.0"
 

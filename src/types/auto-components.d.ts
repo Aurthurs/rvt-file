@@ -12,13 +12,16 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AppSidebar: typeof import('./../components/layout/AppSidebar.vue')['default']
+    BackBar: typeof import('./../components/common/BackBar.vue')['default']
     NButton: typeof import('naive-ui')['NButton']
     NConfigProvider: typeof import('naive-ui')['NConfigProvider']
     NDataTable: typeof import('naive-ui')['NDataTable']
+    NDropdown: typeof import('naive-ui')['NDropdown']
     NEmpty: typeof import('naive-ui')['NEmpty']
     NIcon: typeof import('naive-ui')['NIcon']
     NInput: typeof import('naive-ui')['NInput']
     NMessageProvider: typeof import('naive-ui')['NMessageProvider']
+    NModal: typeof import('naive-ui')['NModal']
     NSelect: typeof import('naive-ui')['NSelect']
     NSpin: typeof import('naive-ui')['NSpin']
     QuickActions: typeof import('./../components/dashboard/QuickActions.vue')['default']

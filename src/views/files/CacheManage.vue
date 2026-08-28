@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { h, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { NButton, NPopconfirm, NTag, useMessage } from "naive-ui";
+import { open } from "@tauri-apps/plugin-dialog";
+import { NButton, NDropdown, NPopconfirm, NTag, useMessage } from "naive-ui";
 import { RefreshOutline } from "@vicons/ionicons5";
+import BackBar from "@components/common/BackBar.vue";
 
 interface CacheEntry {
   name: string;
@@ -28,7 +30,11 @@ function formatTime(ts: number) {
   return new Date(ts * 1000).toLocaleString("zh-CN");
 }
 
+/** 勾选的文件名 */
+const checkedKeys = ref<string[]>([]);
+
 const columns = [
+  { type: "selection" as const },
   { title: "名称", key: "name", ellipsis: { tooltip: true } },
   {
     title: "类型",
@@ -54,20 +60,42 @@ const columns = [
   {
     title: "操作",
     key: "action",
-    width: 90,
+    width: 120,
     render: (row: CacheEntry) =>
       h(
-        NPopconfirm,
-        { onPositiveClick: () => onDelete(row) },
-        {
-          trigger: () =>
-            h(
-              NButton,
-              { size: "small", type: "error", quaternary: true },
-              { default: () => "删除" }
-            ),
-          default: () => `确认删除 ${row.name}？`,
-        }
+        "div",
+        { style: "display:flex;gap:8px" },
+        [
+          h(
+            NDropdown,
+            {
+              options: exportOptions,
+              onSelect: (k: string) => onExportSingle(row, k),
+            },
+            {
+              // n-dropdown 的触发元素是 default slot
+              default: () =>
+                h(
+                  NButton,
+                  { size: "small", secondary: true },
+                  { default: () => "导出" }
+                ),
+            }
+          ),
+          h(
+            NPopconfirm,
+            { onPositiveClick: () => onDelete(row) },
+            {
+              trigger: () =>
+                h(
+                  NButton,
+                  { size: "small", type: "error", quaternary: true },
+                  { default: () => "删除" }
+                ),
+              default: () => `确认删除 ${row.name}？`,
+            }
+          ),
+        ]
       ),
   },
 ];
@@ -80,6 +108,9 @@ async function refresh() {
     );
     dataPath.value = res.path;
     entries.value = res.entries;
+    // 同步勾选状态：移除列表中已不存在的项（例如刚被单独删除的文件）
+    const valid = new Set(res.entries.map((e) => e.name));
+    checkedKeys.value = checkedKeys.value.filter((k) => valid.has(k));
   } catch (e) {
     message.error(String(e));
   } finally {
@@ -105,11 +136,110 @@ async function onClear() {
   refresh();
 }
 
+/** 批量删除勾选的文件 */
+async function onBatchDelete() {
+  const keys = [...checkedKeys.value];
+  for (const name of keys) {
+    await invoke("delete_cache", { name }).catch(() => {});
+  }
+  message.success(`已删除 ${keys.length} 项`);
+  checkedKeys.value = [];
+  refresh();
+}
+
+const exportOptions = [
+  { label: "CSV", key: "csv" },
+  { label: "Excel (.xlsx)", key: "xlsx" },
+  { label: "Parquet", key: "parquet" },
+];
+
+/** 批量导出：每个选中文件独立导出为所选格式 */
+async function onExport(format: string) {
+  if (!checkedKeys.value.length) return;
+  const dir = await open({ directory: true, title: "选择导出目录" });
+  if (!dir) return;
+  try {
+    const res = await invoke<{ exported: string[]; total: number }>(
+      "export_files",
+      {
+        req: {
+          keys: [...checkedKeys.value],
+          format,
+          output_dir: dir,
+          merge: false,
+        },
+      }
+    );
+    message.success(`已导出 ${res.total} 个文件到 ${dir}`);
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
+/** 单个文件导出（行内操作，格式下拉与批量一致） */
+async function onExportSingle(entry: CacheEntry, format: string) {
+  const dir = await open({ directory: true, title: "选择导出目录" });
+  if (!dir) return;
+  try {
+    await invoke<{ exported: string[]; total: number }>("export_files", {
+      req: {
+        keys: [entry.name],
+        format,
+        output_dir: dir,
+        merge: false,
+        file_name: null,
+      },
+    });
+    message.success(`已导出 ${entry.name}`);
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
+/** 合并导出：弹窗输入文件名，所有选中文件导出为一个 xlsx，每个文件一个 sheet */
+const showNameModal = ref(false);
+const exportName = ref("合并导出.xlsx");
+
+function onExportMerge() {
+  if (!checkedKeys.value.length) return;
+  exportName.value = "合并导出.xlsx";
+  showNameModal.value = true;
+}
+
+async function confirmExportMerge() {
+  const name = exportName.value.trim();
+  if (!name) {
+    message.info("请输入文件名");
+    return;
+  }
+  showNameModal.value = false;
+  const dir = await open({ directory: true, title: "选择导出目录" });
+  if (!dir) return;
+  try {
+    const res = await invoke<{ exported: string[]; total: number }>(
+      "export_files",
+      {
+        req: {
+          keys: [...checkedKeys.value],
+          format: "xlsx",
+          output_dir: dir,
+          merge: true,
+          file_name: name,
+        },
+      }
+    );
+    message.success(`已合并导出 ${res.total} 个文件到 ${dir}`);
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
 onMounted(refresh);
 </script>
 
 <template>
   <div class="page">
+    <BackBar />
     <h2>缓存管理</h2>
     <p class="sub">管理 data 目录下的缓存文件与文件夹。</p>
 
@@ -120,6 +250,26 @@ onMounted(refresh);
             <n-icon><RefreshOutline /></n-icon>
           </template>
           刷新
+        </n-button>
+        <n-popconfirm
+          v-if="checkedKeys.length"
+          @positive-click="onBatchDelete"
+        >
+          <template #trigger>
+            <n-button type="error" secondary>
+              批量删除 ({{ checkedKeys.length }})
+            </n-button>
+          </template>
+          确认删除选中的 {{ checkedKeys.length }} 项？
+        </n-popconfirm>
+        <n-dropdown
+          :options="exportOptions"
+          @select="(k) => onExport(k as string)"
+        >
+          <n-button :disabled="!checkedKeys.length">批量导出</n-button>
+        </n-dropdown>
+        <n-button :disabled="!checkedKeys.length" @click="onExportMerge">
+          合并导出
         </n-button>
         <n-button type="error" secondary :disabled="!entries.length" @click="onClear">
           清空全部
@@ -132,10 +282,27 @@ onMounted(refresh);
         :columns="columns"
         :data="entries"
         :row-key="(row: CacheEntry) => row.name"
+        v-model:checked-row-keys="checkedKeys"
         :pagination="{ pageSize: 10 }"
         :loading="loading"
       />
     </div>
+
+    <n-modal
+      v-model:show="showNameModal"
+      preset="dialog"
+      title="合并导出"
+      :positive-text="'确定导出'"
+      negative-text="取消"
+      @positive-click="confirmExportMerge"
+    >
+      <n-input
+        v-model:value="exportName"
+        placeholder="输入导出文件名（自动补 .xlsx）"
+        @keyup.enter="confirmExportMerge"
+      />
+    </n-modal>
+
   </div>
 </template>
 

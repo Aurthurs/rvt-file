@@ -1,5 +1,10 @@
+<script setup lang="ts">
+import BackBar from "@components/common/BackBar.vue";
+</script>
+
 <template>
   <div class="page">
+    <BackBar />
     <h2>质量检测</h2>
     <p class="sub">检查文件完整性与质量。</p>
     <div class="placeholder">

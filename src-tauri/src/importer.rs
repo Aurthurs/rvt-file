@@ -3,10 +3,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Float64Builder, Int64Array, Int64Builder, StringArray,
-    StringBuilder,
-};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray, StringBuilder};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use calamine::{open_workbook_auto, Data, Reader};
@@ -32,12 +29,6 @@ pub struct ImportMeta {
     pub key: String,
     pub source: String,
     pub sheet: String,
-}
-
-enum ColType {
-    Int,
-    Float,
-    Str,
 }
 
 /// 数据目录：exe 同目录下的 data/，打包成 exe 后即 exe 旁文件夹
@@ -158,15 +149,16 @@ fn build_import(
         })
         .collect();
 
-    let col_types: Vec<ColType> = (0..col_count)
-        .map(|i| infer_type(rows.iter().map(|r| r.get(i).unwrap_or(&None))))
-        .collect();
-
+    // 全部按字符串存储，不做类型推断（避免 "06" 变 6、精度丢失等问题）
     let arrays: Vec<ArrayRef> = (0..col_count)
         .map(|i| {
             let values: Vec<Option<String>> =
                 rows.iter().map(|r| r.get(i).cloned().flatten()).collect();
-            build_array(&values, &col_types[i])
+            let mut b = StringBuilder::new();
+            for v in &values {
+                b.append_option(v.as_deref());
+            }
+            Arc::new(b.finish()) as ArrayRef
         })
         .collect();
 
@@ -182,7 +174,7 @@ fn build_import(
                 n += 1;
             }
             used.insert(unique.clone());
-            Field::new(unique, arrow_type(&col_types[i]), true)
+            Field::new(unique, ArrowDataType::Utf8, true)
         })
         .collect();
     let schema = Arc::new(Schema::new(fields));
@@ -280,69 +272,6 @@ fn cell_to_string(cell: &Data) -> Option<String> {
         Data::DateTimeIso(s) => Some(s.clone()),
         Data::DurationIso(s) => Some(s.clone()),
         Data::Error(e) => Some(format!("错误: {e}")),
-    }
-}
-
-/// 列类型推断：全部为整数 -> Int，全部可解析为数字 -> Float，否则 String
-fn infer_type<'a>(values: impl Iterator<Item = &'a Option<String>>) -> ColType {
-    let mut all_int = true;
-    let mut all_num = true;
-    for v in values {
-        if let Some(s) = v {
-            if s.parse::<i64>().is_err() {
-                all_int = false;
-            }
-            if s.parse::<f64>().is_err() {
-                all_num = false;
-            }
-        }
-    }
-    if !all_num {
-        ColType::Str
-    } else if all_int {
-        ColType::Int
-    } else {
-        ColType::Float
-    }
-}
-
-fn arrow_type(t: &ColType) -> ArrowDataType {
-    match t {
-        ColType::Int => ArrowDataType::Int64,
-        ColType::Float => ArrowDataType::Float64,
-        ColType::Str => ArrowDataType::Utf8,
-    }
-}
-
-fn build_array(values: &[Option<String>], t: &ColType) -> ArrayRef {
-    match t {
-        ColType::Int => {
-            let mut b = Int64Builder::new();
-            for v in values {
-                match v {
-                    Some(s) => b.append_value(s.parse().unwrap_or(0)),
-                    None => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        ColType::Float => {
-            let mut b = Float64Builder::new();
-            for v in values {
-                match v {
-                    Some(s) => b.append_value(s.parse().unwrap_or(0.0)),
-                    None => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        ColType::Str => {
-            let mut b = StringBuilder::new();
-            for v in values {
-                b.append_option(v.as_deref());
-            }
-            Arc::new(b.finish())
-        }
     }
 }
 
@@ -529,16 +458,29 @@ fn row_matches(batch: &RecordBatch, i: usize, col: usize, fv: &str) -> bool {
 
 fn array_value(arr: &ArrayRef, i: usize) -> Value {
     let null = || Value::Null;
+    // 统一按字符串返回，不依赖类型推断（避免数字丢失前导零/精度、科学计数法等）
     match arr.data_type() {
         ArrowDataType::Int64 => arr
             .as_any()
             .downcast_ref::<Int64Array>()
-            .map(|a| if a.is_null(i) { null() } else { json!(a.value(i)) })
+            .map(|a| {
+                if a.is_null(i) {
+                    null()
+                } else {
+                    Value::String(a.value(i).to_string())
+                }
+            })
             .unwrap_or_else(null),
         ArrowDataType::Float64 => arr
             .as_any()
             .downcast_ref::<Float64Array>()
-            .map(|a| if a.is_null(i) { null() } else { json!(a.value(i)) })
+            .map(|a| {
+                if a.is_null(i) {
+                    null()
+                } else {
+                    Value::String(a.value(i).to_string())
+                }
+            })
             .unwrap_or_else(null),
         ArrowDataType::Utf8 => arr
             .as_any()
@@ -547,7 +489,7 @@ fn array_value(arr: &ArrayRef, i: usize) -> Value {
                 if a.is_null(i) {
                     null()
                 } else {
-                    json!(a.value(i))
+                    Value::String(a.value(i).to_string())
                 }
             })
             .unwrap_or_else(null),
@@ -577,6 +519,11 @@ pub fn list_cache() -> Result<CacheInfo, String> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| format!("读取目录失败: {e}"))? {
         let entry = entry.map_err(|e| format!("读取目录项失败: {e}"))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        // manifest.json 是内部清单，不展示
+        if name == "manifest.json" {
+            continue;
+        }
         let md = entry.metadata().map_err(|e| format!("读取元数据失败: {e}"))?;
         let modified = md
             .modified()
@@ -585,7 +532,7 @@ pub fn list_cache() -> Result<CacheInfo, String> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         entries.push(CacheEntry {
-            name: entry.file_name().to_string_lossy().to_string(),
+            name,
             kind: if md.is_dir() { "dir".to_string() } else { "file".to_string() },
             size: md.len(),
             modified,
@@ -600,6 +547,9 @@ pub fn list_cache() -> Result<CacheInfo, String> {
 /// 删除 data/ 下指定文件或文件夹（含路径穿越防护），同步清理 manifest
 #[tauri::command]
 pub fn delete_cache(name: String) -> Result<(), String> {
+    if name == "manifest.json" {
+        return Err("manifest.json 为系统清单文件，不允许删除".to_string());
+    }
     let dir = data_dir()?;
     let base = dir
         .canonicalize()
@@ -622,11 +572,322 @@ pub fn delete_cache(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 导出请求
+#[derive(Deserialize)]
+pub struct ExportRequest {
+    pub keys: Vec<String>,
+    pub format: String, // "csv" | "xlsx" | "parquet"
+    pub output_dir: String,
+    pub merge: bool, // true = 合并到一个 xlsx，每个文件一个 sheet
+    pub file_name: Option<String>, // 合并导出时的自定义文件名
+}
+
+#[derive(Serialize)]
+pub struct ExportResult {
+    pub exported: Vec<String>,
+    pub total: usize,
+}
+
+/// 读取 parquet 全表，返回列名 + 数据
+fn read_table_full(key: &str) -> Result<(Vec<String>, Vec<Vec<Value>>), String> {
+    let path = data_dir()?.join(key);
+    if !path.exists() {
+        return Err(format!("文件不存在: {key}"));
+    }
+    let file = File::open(&path).map_err(|e| format!("无法打开文件: {e}"))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| format!("读取失败: {e}"))?;
+    let columns: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    let reader = builder.build().map_err(|e| format!("解析失败: {e}"))?;
+    let num_cols = columns.len();
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("读取数据失败: {e}"))?;
+        for i in 0..batch.num_rows() {
+            rows.push(
+                (0..num_cols)
+                    .map(|c| array_value(batch.column(c), i))
+                    .collect(),
+            );
+        }
+    }
+    Ok((columns, rows))
+}
+
+fn value_to_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn write_csv(path: &Path, columns: &[String], rows: &[Vec<Value>]) -> Result<(), String> {
+    use std::io::{BufWriter, Write};
+    // 文件开头写 UTF-8 BOM，保证 Excel 打开中文不乱码
+    let file = File::create(path).map_err(|e| format!("创建 CSV 失败: {e}"))?;
+    let mut buf = BufWriter::new(file);
+    buf.write_all(b"\xEF\xBB\xBF")
+        .map_err(|e| format!("写入 BOM 失败: {e}"))?;
+    let mut wtr = csv::WriterBuilder::new().from_writer(buf);
+    wtr.write_record(columns)
+        .map_err(|e| format!("写入表头失败: {e}"))?;
+    for row in rows {
+        let rec: Vec<String> = row.iter().map(value_to_string).collect();
+        wtr.write_record(&rec).map_err(|e| format!("写入行失败: {e}"))?;
+    }
+    wtr.flush().map_err(|e| format!("保存失败: {e}"))?;
+    Ok(())
+}
+
+/// xlsx 工作表名：去扩展名、替换非法字符、截断 31 字符
+fn sanitize_sheet(name: &str) -> String {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    stem.chars()
+        .map(|c| match c {
+            ':' | '\\' | '/' | '?' | '*' | '[' | ']' => '_',
+            c => c,
+        })
+        .collect::<String>()
+        .chars()
+        .take(31)
+        .collect()
+}
+
+/// 导出用文件名/sheet 名：优先源文件名，退回 parquet 名
+fn sheet_label(key: &str) -> String {
+    load_manifest()
+        .unwrap_or_default()
+        .get(key)
+        .map(|(s, _)| s.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// 写 xlsx（支持多 sheet）
+fn write_xlsx(
+    path: &Path,
+    sheets: &[(String, Vec<String>, Vec<Vec<Value>>)],
+) -> Result<(), String> {
+    use rust_xlsxwriter::{Workbook, Worksheet};
+    use std::collections::HashSet;
+    let mut workbook = Workbook::new();
+    let mut used: HashSet<String> = HashSet::new();
+    for (name, columns, rows) in sheets {
+        // 工作表名去重：同名加序号
+        let base = sanitize_sheet(name);
+        let mut sheet_name = base.clone();
+        let mut n = 1;
+        while used.contains(&sheet_name) {
+            sheet_name = format!("{base}_{n}");
+            n += 1;
+        }
+        used.insert(sheet_name.clone());
+        let mut ws = Worksheet::new();
+        ws.set_name(&sheet_name)
+            .map_err(|e| format!("设置工作表名失败: {e}"))?;
+        for (c, col) in columns.iter().enumerate() {
+            ws.write_string(0, c as u16, col)
+                .map_err(|e| format!("写入表头失败: {e}"))?;
+        }
+        for (r, row) in rows.iter().enumerate() {
+            let rr = (r + 1) as u32;
+            for (c, v) in row.iter().enumerate() {
+                let cc = c as u16;
+                match v {
+                    Value::Null => {}
+                    Value::String(s) => {
+                        ws.write_string(rr, cc, s).map_err(|e| format!("写入失败: {e}"))?;
+                    }
+                    Value::Number(n) => {
+                        ws.write_number(rr, cc, n.as_f64().unwrap_or(0.0))
+                            .map_err(|e| format!("写入失败: {e}"))?;
+                    }
+                    Value::Bool(b) => {
+                        ws.write_boolean(rr, cc, *b).map_err(|e| format!("写入失败: {e}"))?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        workbook.push_worksheet(ws);
+    }
+    workbook.save(path).map_err(|e| format!("保存 xlsx 失败: {e}"))?;
+    Ok(())
+}
+
+/// 导出：批量导出（每文件独立文件）或合并导出（一个 xlsx，每文件一个 sheet）
+#[tauri::command]
+pub fn export_files(req: ExportRequest) -> Result<ExportResult, String> {
+    if req.keys.is_empty() {
+        return Err("未选择文件".to_string());
+    }
+    let out = Path::new(&req.output_dir);
+    if !out.is_dir() {
+        return Err(format!("输出目录不存在: {}", req.output_dir));
+    }
+    let mut exported = Vec::new();
+
+    if req.merge {
+        let mut sheets = Vec::new();
+        for key in &req.keys {
+            let (columns, rows) = read_table_full(key)?;
+            sheets.push((sheet_label(key), columns, rows));
+        }
+        // 合并导出文件名：可用自定义名，缺省 "合并导出.xlsx"
+        let raw = req
+            .file_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("合并导出.xlsx");
+        let raw = if raw.ends_with(".xlsx") {
+            raw.to_string()
+        } else {
+            format!("{raw}.xlsx")
+        };
+        let out_path = out.join(&raw);
+        write_xlsx(&out_path, &sheets)?;
+        exported.push(raw);
+    } else {
+        for key in &req.keys {
+            let (columns, rows) = read_table_full(key)?;
+            let stem = key.rsplit_once('.').map(|(s, _)| s).unwrap_or(key);
+            match req.format.as_str() {
+                "csv" => {
+                    let out_path = out.join(format!("{stem}.csv"));
+                    write_csv(&out_path, &columns, &rows)?;
+                    exported.push(
+                        out_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                }
+                "xlsx" => {
+                    let out_path = out.join(format!("{stem}.xlsx"));
+                    write_xlsx(&out_path, &[(sheet_label(key), columns, rows)])?;
+                    exported.push(
+                        out_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                }
+                "parquet" => {
+                    let src = data_dir()?.join(key);
+                    let out_path = out.join(key);
+                    std::fs::copy(&src, &out_path)
+                        .map_err(|e| format!("复制失败: {e}"))?;
+                    exported.push(key.clone());
+                }
+                _ => return Err(format!("不支持的格式: {}", req.format)),
+            }
+        }
+    }
+
+    Ok(ExportResult {
+        total: exported.len(),
+        exported,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
     use std::io::Write;
+
+    /// 导出功能：批量导出 csv + 合并导出 xlsx
+    #[test]
+    fn export_files_works() {
+        let tmp = std::env::temp_dir().join("rvt_export_src.csv");
+        let mut f = File::create(&tmp).unwrap();
+        f.write_all(b"name,age\nAlice,25\nBob,30\n").unwrap();
+        import_file(tmp.to_string_lossy().to_string()).unwrap();
+
+        let out = std::env::temp_dir().join("rvt_export_out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // 批量导出 csv
+        let res = export_files(ExportRequest {
+            keys: vec!["rvt_export_src.parquet".to_string()],
+            format: "csv".to_string(),
+            output_dir: out.to_string_lossy().to_string(),
+            merge: false,
+            file_name: None,
+        })
+        .unwrap();
+        assert_eq!(res.total, 1);
+        let csv_path = out.join("rvt_export_src.csv");
+        assert!(csv_path.exists());
+        // 校验 UTF-8 BOM（Excel 兼容）
+        let head = std::fs::read(&csv_path).unwrap();
+        assert_eq!(&head[..3], b"\xEF\xBB\xBF", "CSV 缺少 UTF-8 BOM");
+
+        // 合并导出 xlsx（每文件一个 sheet）
+        let res2 = export_files(ExportRequest {
+            keys: vec!["rvt_export_src.parquet".to_string()],
+            format: "xlsx".to_string(),
+            output_dir: out.to_string_lossy().to_string(),
+            merge: true,
+            file_name: None,
+        })
+        .unwrap();
+        assert_eq!(res2.total, 1);
+        assert!(out.join("合并导出.xlsx").exists());
+
+        // 自定义合并导出文件名
+        let res3 = export_files(ExportRequest {
+            keys: vec!["rvt_export_src.parquet".to_string()],
+            format: "xlsx".to_string(),
+            output_dir: out.to_string_lossy().to_string(),
+            merge: true,
+            file_name: Some("汇总数据".to_string()),
+        })
+        .unwrap();
+        assert_eq!(res3.total, 1);
+        assert!(out.join("汇总数据.xlsx").exists());
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&out);
+        let _ = std::fs::remove_file(data_dir().unwrap().join("rvt_export_src.parquet"));
+    }
+
+    /// 合并导出时同名源文件的工作表名应去重
+    #[test]
+    fn xlsx_sheet_name_dedup() {
+        let out = std::env::temp_dir().join("rvt_dedup.xlsx");
+        let sheets = vec![
+            ("note.xlsx".to_string(), vec!["a".to_string()], vec![]),
+            ("note.xlsx".to_string(), vec!["b".to_string()], vec![]),
+        ];
+        write_xlsx(&out, &sheets).unwrap();
+        assert!(out.exists());
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// 删除 parquet 文件时应同步清理 manifest 记录
+    #[test]
+    fn delete_cache_cleans_manifest() {
+        let key = "test_delete.parquet";
+        let p = data_dir().unwrap().join(key);
+        std::fs::write(&p, b"dummy").unwrap();
+        update_manifest(key, "test.csv", "Sheet1").unwrap();
+        assert!(load_manifest().unwrap().contains_key(key));
+
+        delete_cache(key.to_string()).unwrap();
+
+        assert!(!p.exists());
+        assert!(!load_manifest().unwrap().contains_key(key));
+    }
 
     /// 对真实导入的 parquet 验证筛选（文件存在才跑）
     #[test]
@@ -721,8 +982,12 @@ mod tests {
         .unwrap();
         assert_eq!(back.columns, vec!["name", "age", "score"]);
         assert_eq!(back.row_count, 2);
-        assert_eq!(back.rows[0], vec![json!("Alice"), json!(25), json!(90.5)]);
-        assert_eq!(back.rows[1], vec![json!("Bob"), json!(30), Value::Null]);
+        // 读取统一为字符串，不依赖类型推断
+        assert_eq!(
+            back.rows[0],
+            vec![json!("Alice"), json!("25"), json!("90.5")]
+        );
+        assert_eq!(back.rows[1], vec![json!("Bob"), json!("30"), Value::Null]);
 
         // 字段值模糊筛选：name 列含 "ali"
         let filtered = read_parquet(ReadRequest {

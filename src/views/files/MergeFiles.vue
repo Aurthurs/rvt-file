@@ -1,5 +1,10 @@
+<script setup lang="ts">
+import BackBar from "@components/common/BackBar.vue";
+</script>
+
 <template>
   <div class="page">
+    <BackBar />
     <h2>文件融合</h2>
     <p class="sub">合并多个 RVT 文件为一个工程。</p>
     <div class="placeholder">

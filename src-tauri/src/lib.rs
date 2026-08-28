@@ -17,7 +17,8 @@ pub fn run() {
             importer::list_imported,
             importer::read_parquet,
             importer::list_cache,
-            importer::delete_cache
+            importer::delete_cache,
+            importer::export_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

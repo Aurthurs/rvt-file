@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useMessage } from "naive-ui";
 import { FilterOutline } from "@vicons/ionicons5";
+import BackBar from "@components/common/BackBar.vue";
 
 interface ImportedFile {
   key: string;
@@ -274,6 +275,7 @@ async function onUpload() {
 
 <template>
   <div class="page">
+    <BackBar />
     <h2>预览文件</h2>
     <p class="sub">上传 xlsx / xls / csv 文件，自动转换为 parquet 并预览数据。</p>
 
