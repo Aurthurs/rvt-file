@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray, StringBuilder};
@@ -10,6 +11,7 @@ use calamine::{open_workbook_auto, Data, Reader};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use serde_json::Value;
+use tauri::Emitter;
 use tauri::Manager;
 
 /// 导入结果，rows 直接序列化为 JSON 供前端表格展示
@@ -85,126 +87,340 @@ fn remove_manifest(key: &str) -> Result<(), String> {
     save_manifest(&m)
 }
 
+/// 导入请求参数
+#[derive(serde::Deserialize)]
+pub struct ImportRequest {
+    pub path: String,
+    /// 分批行数：每批写入 parquet 的行数，由设置页配置
+    pub batch_rows: usize,
+}
+
 /// 导入文件：Excel 每个 sheet 转换成一个 parquet，csv 转换成一个。
+/// 异步执行避免阻塞主线程（大文件导入时窗口不假死），流式分批写 parquet 控制内存。
 /// 返回所有导入结果，key 为 parquet 文件名。
 #[tauri::command]
-pub fn import_file(path: String) -> Result<Vec<ImportResult>, String> {
-    let src = Path::new(&path);
-    if !src.exists() {
-        return Err(format!("文件不存在: {path}"));
-    }
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let source_name = src
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("文件")
-        .to_string();
-
-    let tables: Vec<(String, Vec<Option<String>>, Vec<Vec<Option<String>>>)> = match ext.as_str() {
-        "csv" => {
-            let (headers, rows) = read_csv(src)?;
-            vec![(String::new(), headers, rows)]
+pub async fn import_file(
+    app: tauri::AppHandle,
+    req: ImportRequest,
+) -> Result<Vec<ImportResult>, String> {
+    let path = req.path;
+    let batch_rows = req.batch_rows.max(1);
+    IMPORT_CANCEL.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || {
+        let src = Path::new(&path);
+        if !src.exists() {
+            return Err(format!("文件不存在: {path}"));
         }
-        "xlsx" | "xls" => read_excel_all(src)?,
-        _ => return Err(format!("不支持的格式: {ext}")),
-    };
-
-    let mut results = Vec::new();
-    for (sheet, headers, rows) in tables {
-        if rows.is_empty() {
-            continue;
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+        let source_name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("文件")
+            .to_string();
+        match ext.as_str() {
+            "csv" => import_csv(Some(&app), src, stem, &source_name, batch_rows),
+            "xlsx" | "xls" => import_excel(Some(&app), src, stem, &source_name, batch_rows),
+            _ => Err(format!("不支持的格式: {ext}")),
         }
-        let key = if sheet.is_empty() {
-            format!("{stem}.parquet")
+    })
+    .await
+    .map_err(|e| format!("导入任务异常: {e}"))?
+}
+
+/// 导入进度（前端监听 import-progress 事件）
+#[derive(serde::Serialize, Clone)]
+pub struct ImportProgress {
+    pub source: String,
+    pub sheet: String,
+    /// 阶段："read" 解析源文件 / "write" 转换写 parquet
+    pub stage: String,
+    /// 已处理的数据行数
+    pub processed: usize,
+    /// 总数据行数；0 表示未知（如解析阶段）
+    pub total: usize,
+    /// 当前是第几个 sheet（1-based）
+    pub sheet_index: usize,
+    /// 总共几个 sheet
+    pub sheet_count: usize,
+}
+
+fn emit_progress(app: &tauri::AppHandle, p: &ImportProgress) {
+    let _ = app.emit("import-progress", p);
+}
+
+/// 导入取消标志：cancel_import 置位后，导入循环在检查点终止
+static IMPORT_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// 手动取消当前导入任务
+#[tauri::command]
+pub fn cancel_import() -> Result<(), String> {
+    IMPORT_CANCEL.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 攒批写入：builders -> RecordBatch -> ArrowWriter，随后重建 builders
+fn flush_batch(
+    writer: &mut ArrowWriter<File>,
+    schema: &arrow::datatypes::SchemaRef,
+    builders: &mut Vec<StringBuilder>,
+) -> Result<(), String> {
+    let arrays: Vec<ArrayRef> = builders
+        .iter_mut()
+        .map(|b| Arc::new(b.finish()) as ArrayRef)
+        .collect();
+    let batch =
+        RecordBatch::try_new(schema.clone(), arrays).map_err(|e| format!("构建数据失败: {e}"))?;
+    writer
+        .write(&batch)
+        .map_err(|e| format!("写入 parquet 失败: {e}"))?;
+    *builders = schema
+        .fields()
+        .iter()
+        .map(|_| StringBuilder::new())
+        .collect();
+    Ok(())
+}
+
+/// 列名去重：重复列加 _1 _2 后缀，空列名用 列N 兜底
+fn unique_columns(headers: Vec<String>, col_count: usize) -> Vec<String> {
+    let mut used: HashSet<String> = HashSet::new();
+    let mut columns = Vec::with_capacity(col_count);
+    for i in 0..col_count {
+        let base = headers.get(i).map(|s| s.as_str()).unwrap_or("").trim();
+        let base = if base.is_empty() {
+            format!("列{}", i + 1)
         } else {
-            format!("{stem}_{}.parquet", sanitize(&sheet))
+            base.to_string()
         };
-        results.push(build_import(&key, &source_name, &sheet, headers, rows)?);
-        update_manifest(&key, &source_name, &sheet)?;
+        let mut unique = base.clone();
+        let mut n = 1;
+        while used.contains(&unique) {
+            unique = format!("{base}_{n}");
+            n += 1;
+        }
+        used.insert(unique.clone());
+        columns.push(unique);
+    }
+    columns
+}
+
+/// CSV 流式导入：边读边分批写 parquet，内存占用与行数无关
+fn import_csv(
+    app: Option<&tauri::AppHandle>,
+    src: &Path,
+    stem: &str,
+    source_name: &str,
+    batch_rows: usize,
+) -> Result<Vec<ImportResult>, String> {
+    let mut reader = csv::Reader::from_path(src).map_err(|e| format!("读取 CSV 失败: {e}"))?;
+    let header_row = reader
+        .headers()
+        .map_err(|e| format!("读取表头失败: {e}"))?
+        .clone();
+    let columns = unique_columns(
+        header_row.iter().map(|h| h.to_string()).collect(),
+        header_row.len(),
+    );
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|c| Field::new(c, ArrowDataType::Utf8, true))
+            .collect::<Vec<Field>>(),
+    ));
+    let key = format!("{stem}.parquet");
+    let out_path = data_dir()?.join(&key);
+    let file = File::create(&out_path).map_err(|e| format!("无法创建 parquet 文件: {e}"))?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None)
+        .map_err(|e| format!("创建 parquet 写入器失败: {e}"))?;
+    let mut builders: Vec<StringBuilder> = columns.iter().map(|_| StringBuilder::new()).collect();
+    let mut processed = 0usize;
+    for rec in reader.records() {
+        if IMPORT_CANCEL.load(Ordering::Relaxed) {
+            drop(writer);
+            let _ = std::fs::remove_file(&out_path);
+            return Err("导入已取消".to_string());
+        }
+        let rec = rec.map_err(|e| format!("读取 CSV 行失败: {e}"))?;
+        for i in 0..columns.len() {
+            let v = rec.get(i).map(|s| s.trim()).unwrap_or("");
+            builders[i].append_option(if v.is_empty() { None } else { Some(v) });
+        }
+        processed += 1;
+        if processed % 5000 == 0 {
+            if let Some(a) = app {
+                emit_progress(
+                    a,
+                    &ImportProgress {
+                        source: source_name.to_string(),
+                        sheet: String::new(),
+                        stage: "write".to_string(),
+                        processed,
+                        total: 0,
+                        sheet_index: 1,
+                        sheet_count: 1,
+                    },
+                );
+            }
+        }
+        if processed % batch_rows == 0 {
+            flush_batch(&mut writer, &schema, &mut builders)?;
+        }
+    }
+    flush_batch(&mut writer, &schema, &mut builders)?;
+    writer
+        .close()
+        .map_err(|e| format!("保存 parquet 失败: {e}"))?;
+    Ok(vec![ImportResult {
+        key,
+        source: source_name.to_string(),
+        sheet: String::new(),
+        columns,
+        rows: vec![],
+        row_count: processed,
+    }])
+}
+
+/// Excel 导入：每个 sheet 写一个 parquet。calamine 会全量解析到 Range，
+/// 但后续直接分批写 parquet，避免额外的多份字符串副本，降低内存峰值。
+fn import_excel(
+    app: Option<&tauri::AppHandle>,
+    src: &Path,
+    stem: &str,
+    source_name: &str,
+    batch_rows: usize,
+) -> Result<Vec<ImportResult>, String> {
+    let mut wb = open_workbook_auto(src).map_err(|e| format!("无法打开 Excel 文件: {e}"))?;
+    let names = wb.sheet_names().to_vec();
+    if names.is_empty() {
+        return Err("Excel 中没有工作表".to_string());
+    }
+    let mut results = Vec::new();
+    let sheet_count = names.len();
+    for (idx, name) in names.iter().enumerate() {
+        // sheet 间可取消；单个 sheet 的 worksheet_range 全量解析无法中断
+        if IMPORT_CANCEL.load(Ordering::Relaxed) {
+            return Err("导入已取消".to_string());
+        }
+        // 解析阶段：worksheet_range 全量解析无法给出行进度，先发阶段事件
+        if let Some(a) = app {
+            emit_progress(
+                a,
+                &ImportProgress {
+                    source: source_name.to_string(),
+                    sheet: name.clone(),
+                    stage: "read".to_string(),
+                    processed: 0,
+                    total: 0,
+                    sheet_index: idx + 1,
+                    sheet_count,
+                },
+            );
+        }
+        // 每个 sheet 单独处理：出错只跳过该 sheet，不中断整个文件
+        let out = (|| -> Result<Option<ImportResult>, String> {
+            let range = wb
+                .worksheet_range(name)
+                .map_err(|e| format!("读取工作表 {name} 失败: {e}"))?;
+            if range.is_empty() {
+                return Ok(None);
+            }
+            let total = range.height().saturating_sub(1); // 去掉表头
+            let mut rows_iter = range.rows();
+            let header_row = match rows_iter.next() {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            let headers: Vec<String> = header_row
+                .iter()
+                .map(|c| cell_to_string(c).unwrap_or_default())
+                .collect();
+            let columns = unique_columns(headers, range.width());
+
+            let schema = Arc::new(Schema::new(
+                columns
+                    .iter()
+                    .map(|c| Field::new(c, ArrowDataType::Utf8, true))
+                    .collect::<Vec<Field>>(),
+            ));
+            let key = if name.trim().is_empty() {
+                format!("{stem}.parquet")
+            } else {
+                format!("{stem}_{}.parquet", sanitize(&name))
+            };
+            let out_path = data_dir()?.join(&key);
+            let file =
+                File::create(&out_path).map_err(|e| format!("无法创建 parquet 文件: {e}"))?;
+            let mut writer = ArrowWriter::try_new(file, schema.clone(), None)
+                .map_err(|e| format!("创建 parquet 写入器失败: {e}"))?;
+            let mut builders: Vec<StringBuilder> =
+                columns.iter().map(|_| StringBuilder::new()).collect();
+            let mut processed = 0usize;
+            for row in rows_iter {
+                if IMPORT_CANCEL.load(Ordering::Relaxed) {
+                    drop(writer);
+                    let _ = std::fs::remove_file(&out_path);
+                    return Err("导入已取消".to_string());
+                }
+                for i in 0..columns.len() {
+                    let v = row.get(i).and_then(|c| cell_to_string(c));
+                    builders[i].append_option(v);
+                }
+                processed += 1;
+                if processed % 5000 == 0 {
+                    if let Some(a) = app {
+                        emit_progress(
+                            a,
+                            &ImportProgress {
+                                source: source_name.to_string(),
+                                sheet: name.clone(),
+                                stage: "write".to_string(),
+                                processed,
+                                total,
+                                sheet_index: idx + 1,
+                                sheet_count,
+                            },
+                        );
+                    }
+                }
+                if processed % batch_rows == 0 {
+                    flush_batch(&mut writer, &schema, &mut builders)?;
+                }
+            }
+            flush_batch(&mut writer, &schema, &mut builders)?;
+            writer
+                .close()
+                .map_err(|e| format!("保存 parquet 失败: {e}"))?;
+            update_manifest(&key, source_name, &name)?;
+            Ok(Some(ImportResult {
+                key,
+                source: source_name.to_string(),
+                sheet: name.clone(),
+                columns,
+                rows: vec![],
+                row_count: processed,
+            }))
+        })();
+        match out {
+            Ok(Some(r)) => results.push(r),
+            Ok(None) => {} // 空 sheet 静默跳过
+            Err(e) => {
+                // 取消必须中断整个导入，其余错误跳过该 sheet 继续
+                if e == "导入已取消" {
+                    return Err(e);
+                }
+                eprintln!("工作表 {name} 导入失败，已跳过: {e}");
+            }
+        }
     }
     if results.is_empty() {
         return Err("文件没有可导入的数据".to_string());
     }
     Ok(results)
-}
-
-/// 公共转换：类型推断 -> RecordBatch -> 写 parquet，key 为落盘文件名
-fn build_import(
-    key: &str,
-    source: &str,
-    sheet: &str,
-    headers: Vec<Option<String>>,
-    rows: Vec<Vec<Option<String>>>,
-) -> Result<ImportResult, String> {
-    let col_count = headers
-        .len()
-        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
-    let columns: Vec<String> = (0..col_count)
-        .map(|i| {
-            let h = headers
-                .get(i)
-                .and_then(|s| s.as_deref())
-                .unwrap_or("")
-                .trim();
-            if h.is_empty() {
-                format!("列{}", i + 1)
-            } else {
-                h.to_string()
-            }
-        })
-        .collect();
-
-    // 全部按字符串存储，不做类型推断（避免 "06" 变 6、精度丢失等问题）
-    let arrays: Vec<ArrayRef> = (0..col_count)
-        .map(|i| {
-            let values: Vec<Option<String>> =
-                rows.iter().map(|r| r.get(i).cloned().flatten()).collect();
-            let mut b = StringBuilder::new();
-            for v in &values {
-                b.append_option(v.as_deref());
-            }
-            Arc::new(b.finish()) as ArrayRef
-        })
-        .collect();
-
-    let mut used: HashSet<String> = HashSet::new();
-    let fields: Vec<Field> = columns
-        .iter()
-        .enumerate()
-        .map(|(_, name)| {
-            let mut unique = name.clone();
-            let mut n = 1;
-            while used.contains(&unique) {
-                unique = format!("{name}_{n}");
-                n += 1;
-            }
-            used.insert(unique.clone());
-            Field::new(unique, ArrowDataType::Utf8, true)
-        })
-        .collect();
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema, arrays).map_err(|e| format!("构建数据失败: {e}"))?;
-
-    let out_path = data_dir()?.join(key);
-    let file = File::create(&out_path).map_err(|e| format!("无法创建 parquet 文件: {e}"))?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
-        .map_err(|e| format!("创建 parquet 写入器失败: {e}"))?;
-    writer.write(&batch).map_err(|e| format!("写入 parquet 失败: {e}"))?;
-    writer.close().map_err(|e| format!("保存 parquet 失败: {e}"))?;
-
-    Ok(ImportResult {
-        key: key.to_string(),
-        source: source.to_string(),
-        sheet: sheet.to_string(),
-        columns,
-        rows: vec![],
-        row_count: rows.len(),
-    })
 }
 
 /// sheet 名写入文件名前的安全化：替换非法字符
@@ -215,60 +431,6 @@ fn sanitize(name: &str) -> String {
             c => c,
         })
         .collect()
-}
-
-fn read_csv(path: &Path) -> Result<(Vec<Option<String>>, Vec<Vec<Option<String>>>), String> {
-    let mut reader = csv::Reader::from_path(path).map_err(|e| format!("读取 CSV 失败: {e}"))?;
-    let headers: Vec<Option<String>> = reader
-        .headers()
-        .map_err(|e| format!("读取表头失败: {e}"))?
-        .iter()
-        .map(|h| Some(h.to_string()))
-        .collect();
-    let mut rows = Vec::new();
-    for rec in reader.records() {
-        let rec = rec.map_err(|e| format!("读取 CSV 行失败: {e}"))?;
-        rows.push(
-            rec.iter()
-                .map(|v| {
-                    let t = v.trim();
-                    if t.is_empty() {
-                        None
-                    } else {
-                        Some(t.to_string())
-                    }
-                })
-                .collect(),
-        );
-    }
-    Ok((headers, rows))
-}
-
-/// 读取 Excel 所有 sheet，返回 (sheet 名, 表头, 行数据)
-fn read_excel_all(
-    path: &Path,
-) -> Result<Vec<(String, Vec<Option<String>>, Vec<Vec<Option<String>>>)>, String> {
-    let mut wb = open_workbook_auto(path).map_err(|e| format!("无法打开 Excel 文件: {e}"))?;
-    let names = wb.sheet_names().to_vec();
-    if names.is_empty() {
-        return Err("Excel 中没有工作表".to_string());
-    }
-    let mut out = Vec::new();
-    for name in names {
-        let range = wb
-            .worksheet_range(&name)
-            .map_err(|e| format!("读取工作表 {name} 失败: {e}"))?;
-        let mut rows: Vec<Vec<Option<String>>> = range
-            .rows()
-            .map(|row| row.iter().map(cell_to_string).collect())
-            .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        let headers = rows.remove(0);
-        out.push((name, headers, rows));
-    }
-    Ok(out)
 }
 
 fn cell_to_string(cell: &Data) -> Option<String> {
@@ -590,6 +752,9 @@ pub struct ExportRequest {
     pub output_dir: String,
     pub merge: bool, // true = 合并到一个 xlsx，每个文件一个 sheet
     pub file_name: Option<String>, // 合并导出时的自定义文件名
+    /// 导出时应用的筛选条件（预览页按当前筛选导出）；空则导出全量
+    #[serde(default)]
+    pub filters: Vec<Filter>,
 }
 
 #[derive(serde::Serialize)]
@@ -638,22 +803,18 @@ fn value_to_string(v: &Value) -> String {
     }
 }
 
-fn write_csv(path: &Path, columns: &[String], rows: &[Vec<Value>]) -> Result<(), String> {
-    use std::io::{BufWriter, Write};
-    // 文件开头写 UTF-8 BOM，保证 Excel 打开中文不乱码
-    let file = File::create(path).map_err(|e| format!("创建 CSV 失败: {e}"))?;
-    let mut buf = BufWriter::new(file);
-    buf.write_all(b"\xEF\xBB\xBF")
-        .map_err(|e| format!("写入 BOM 失败: {e}"))?;
-    let mut wtr = csv::WriterBuilder::new().from_writer(buf);
-    wtr.write_record(columns)
-        .map_err(|e| format!("写入表头失败: {e}"))?;
-    for row in rows {
-        let rec: Vec<String> = row.iter().map(value_to_string).collect();
-        wtr.write_record(&rec).map_err(|e| format!("写入行失败: {e}"))?;
-    }
-    wtr.flush().map_err(|e| format!("保存失败: {e}"))?;
-    Ok(())
+/// 行是否满足全部筛选条件（与 read_parquet 的模糊匹配语义一致）
+fn row_matches_filters(row: &[Value], filters: &[Filter]) -> bool {
+    filters.iter().all(|f| {
+        let kw = f.value.as_deref().unwrap_or("");
+        if kw.is_empty() {
+            return true;
+        }
+        match f.field {
+            Some(col) => value_to_string(row.get(col).unwrap_or(&Value::Null)).contains(kw),
+            None => row.iter().any(|c| value_to_string(c).contains(kw)),
+        }
+    })
 }
 
 /// xlsx 工作表名：去扩展名、替换非法字符、截断 31 字符
@@ -733,8 +894,15 @@ fn write_xlsx(
 }
 
 /// 导出：批量导出（每文件独立文件）或合并导出（一个 xlsx，每文件一个 sheet）
+/// 导出文件：异步执行避免阻塞主线程（大文件导出时窗口不假死）
 #[tauri::command]
-pub fn export_files(req: ExportRequest) -> Result<ExportResult, String> {
+pub async fn export_files(req: ExportRequest) -> Result<ExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || do_export(req))
+        .await
+        .map_err(|e| format!("导出任务异常: {e}"))?
+}
+
+fn do_export(req: ExportRequest) -> Result<ExportResult, String> {
     if req.keys.is_empty() {
         return Err("未选择文件".to_string());
     }
@@ -766,36 +934,31 @@ pub fn export_files(req: ExportRequest) -> Result<ExportResult, String> {
         exported.push(raw);
     } else {
         for key in &req.keys {
-            let (columns, rows) = read_table_full(key)?;
             let stem = key.rsplit_once('.').map(|(s, _)| s).unwrap_or(key);
             match req.format.as_str() {
                 "csv" => {
+                    // 流式：逐 batch 读 parquet -> 过滤 -> 写 CSV，内存 O(1)
                     let out_path = out.join(format!("{stem}.csv"));
-                    write_csv(&out_path, &columns, &rows)?;
-                    exported.push(
-                        out_path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    );
+                    stream_export_csv(&out_path, key, &req.filters)?;
+                    exported.push(path_name(&out_path));
                 }
                 "xlsx" => {
+                    let (columns, rows) = read_table_full(key)?;
+                    let rows = filter_rows(rows, &req.filters);
                     let out_path = out.join(format!("{stem}.xlsx"));
                     write_xlsx(&out_path, &[(sheet_label(key), columns, rows)])?;
-                    exported.push(
-                        out_path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    );
+                    exported.push(path_name(&out_path));
                 }
                 "parquet" => {
-                    let src = data_dir()?.join(key);
                     let out_path = out.join(key);
-                    std::fs::copy(&src, &out_path)
-                        .map_err(|e| format!("复制失败: {e}"))?;
+                    if req.filters.is_empty() {
+                        let src = data_dir()?.join(key);
+                        std::fs::copy(&src, &out_path)
+                            .map_err(|e| format!("复制失败: {e}"))?;
+                    } else {
+                        // 带筛选时流式重写，避免全量载入内存
+                        stream_export_parquet(&out_path, key, &req.filters)?;
+                    }
                     exported.push(key.clone());
                 }
                 _ => return Err(format!("不支持的格式: {}", req.format)),
@@ -807,6 +970,121 @@ pub fn export_files(req: ExportRequest) -> Result<ExportResult, String> {
         total: exported.len(),
         exported,
     })
+}
+
+fn path_name(p: &Path) -> String {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 按筛选条件过滤行；无筛选时原样返回
+fn filter_rows(rows: Vec<Vec<Value>>, filters: &[Filter]) -> Vec<Vec<Value>> {
+    if filters.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| row_matches_filters(r, filters))
+            .collect()
+    }
+}
+
+/// 流式导出 CSV：逐 batch 读 parquet，按筛选过滤，边读边写，内存与行数无关
+fn stream_export_csv(out_path: &Path, key: &str, filters: &[Filter]) -> Result<(), String> {
+    use std::io::{BufWriter, Write};
+    let path = data_dir()?.join(key);
+    let file = File::open(&path).map_err(|e| format!("无法打开文件: {e}"))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| format!("读取失败: {e}"))?;
+    let columns: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    let reader = builder.build().map_err(|e| format!("解析失败: {e}"))?;
+    let num_cols = columns.len();
+
+    let file = File::create(out_path).map_err(|e| format!("创建 CSV 失败: {e}"))?;
+    let mut buf = BufWriter::new(file);
+    // UTF-8 BOM，保证 Excel 打开中文不乱码
+    buf.write_all(b"\xEF\xBB\xBF")
+        .map_err(|e| format!("写入 BOM 失败: {e}"))?;
+    let mut wtr = csv::WriterBuilder::new().from_writer(buf);
+    wtr.write_record(&columns)
+        .map_err(|e| format!("写入表头失败: {e}"))?;
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("读取数据失败: {e}"))?;
+        for i in 0..batch.num_rows() {
+            let row: Vec<Value> = (0..num_cols)
+                .map(|c| array_value(batch.column(c), i))
+                .collect();
+            if !filters.is_empty() && !row_matches_filters(&row, filters) {
+                continue;
+            }
+            let rec: Vec<String> = row.iter().map(value_to_string).collect();
+            wtr.write_record(&rec).map_err(|e| format!("写入行失败: {e}"))?;
+        }
+    }
+    wtr.flush().map_err(|e| format!("保存失败: {e}"))?;
+    Ok(())
+}
+
+/// 流式导出 parquet（带筛选）：逐 batch 读 -> 过滤 -> 分批写入，内存与行数无关
+fn stream_export_parquet(out_path: &Path, key: &str, filters: &[Filter]) -> Result<(), String> {
+    const BATCH: usize = 8192;
+    let path = data_dir()?.join(key);
+    let file = File::open(&path).map_err(|e| format!("无法打开文件: {e}"))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| format!("读取失败: {e}"))?;
+    let columns: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    let reader = builder.build().map_err(|e| format!("解析失败: {e}"))?;
+    let num_cols = columns.len();
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|c| Field::new(c, ArrowDataType::Utf8, true))
+            .collect::<Vec<Field>>(),
+    ));
+    let file = File::create(out_path).map_err(|e| format!("无法创建文件: {e}"))?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None)
+        .map_err(|e| format!("创建写入器失败: {e}"))?;
+    let mut builders: Vec<StringBuilder> = columns.iter().map(|_| StringBuilder::new()).collect();
+    let mut buffered = 0usize;
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("读取数据失败: {e}"))?;
+        for i in 0..batch.num_rows() {
+            let row: Vec<Value> = (0..num_cols)
+                .map(|c| array_value(batch.column(c), i))
+                .collect();
+            if !filters.is_empty() && !row_matches_filters(&row, filters) {
+                continue;
+            }
+            for (c, v) in row.iter().enumerate() {
+                match v {
+                    Value::Null => builders[c].append_null(),
+                    Value::String(s) => builders[c].append_value(s),
+                    _ => builders[c].append_null(),
+                }
+            }
+            buffered += 1;
+            if buffered >= BATCH {
+                flush_batch(&mut writer, &schema, &mut builders)?;
+                buffered = 0;
+            }
+        }
+    }
+    flush_batch(&mut writer, &schema, &mut builders)?;
+    writer
+        .close()
+        .map_err(|e| format!("保存失败: {e}"))?;
+    Ok(())
 }
 
 /// 质量检测请求
@@ -949,6 +1227,15 @@ fn join_key(row: &[Value], idx: &[usize]) -> String {
 
 /// 写全字符串的 parquet 到 data/
 fn write_values_parquet(key: &str, columns: &[String], rows: &[Vec<Value>]) -> Result<(), String> {
+    write_values_parquet_to(&data_dir()?.join(key), columns, rows)
+}
+
+/// 写全字符串的 parquet 到指定路径
+fn write_values_parquet_to(
+    out_path: &Path,
+    columns: &[String],
+    rows: &[Vec<Value>],
+) -> Result<(), String> {
     let arrays: Vec<ArrayRef> = (0..columns.len())
         .map(|i| {
             let mut b = StringBuilder::new();
@@ -968,8 +1255,7 @@ fn write_values_parquet(key: &str, columns: &[String], rows: &[Vec<Value>]) -> R
         .collect();
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema, arrays).map_err(|e| format!("构建数据失败: {e}"))?;
-    let out_path = data_dir()?.join(key);
-    let file = File::create(&out_path).map_err(|e| format!("无法创建文件: {e}"))?;
+    let file = File::create(out_path).map_err(|e| format!("无法创建文件: {e}"))?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
         .map_err(|e| format!("创建写入器失败: {e}"))?;
     writer.write(&batch).map_err(|e| format!("写入失败: {e}"))?;
@@ -1154,6 +1440,8 @@ pub struct AppSettings {
     pub page_size: usize,
     /// 工作台快捷入口的功能 key 列表；为空则显示全部
     pub quick_entries: Vec<String>,
+    /// 导入分批行数：每批写入 parquet 的行数，控制内存峰值
+    pub batch_rows: usize,
 }
 
 impl Default for AppSettings {
@@ -1162,6 +1450,7 @@ impl Default for AppSettings {
             theme: "light".to_string(),
             page_size: 10,
             quick_entries: vec![],
+            batch_rows: 8192,
         }
     }
 }
@@ -1250,17 +1539,17 @@ mod tests {
         let m = std::env::temp_dir().join("rvt_merge_main.csv");
         let mut f = File::create(&m).unwrap();
         f.write_all(b"id,name\n1,Alice\n2,Bob\n").unwrap();
-        import_file(m.to_string_lossy().to_string()).unwrap();
+        import_csv(None, &m, "rvt_merge_main", "rvt_merge_main.csv", 8192).unwrap();
 
         let a = std::env::temp_dir().join("rvt_merge_a.csv");
         let mut f = File::create(&a).unwrap();
         f.write_all(b"id,name,extra\n1,Al,X\n2,Bo,Y\n").unwrap();
-        import_file(a.to_string_lossy().to_string()).unwrap();
+        import_csv(None, &a, "rvt_merge_a", "rvt_merge_a.csv", 8192).unwrap();
 
         let b = std::env::temp_dir().join("rvt_merge_b.csv");
         let mut f = File::create(&b).unwrap();
         f.write_all(b"id,name\n1,A1\n2,B2\n").unwrap();
-        import_file(b.to_string_lossy().to_string()).unwrap();
+        import_csv(None, &b, "rvt_merge_b", "rvt_merge_b.csv", 8192).unwrap();
 
         let res = merge_files(MergeRequest {
             main_key: "rvt_merge_main.parquet".to_string(),
@@ -1324,7 +1613,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("rvt_scan.csv");
         let mut f = File::create(&tmp).unwrap();
         f.write_all(b"name,age\nAlice,25\nBob,30\nCharlie,\n").unwrap();
-        import_file(tmp.to_string_lossy().to_string()).unwrap();
+        import_csv(None, &tmp, "rvt_scan", "rvt_scan.csv", 8192).unwrap();
 
         let res = scan_quality(QualityRequest {
             key: "rvt_scan.parquet".to_string(),
@@ -1358,18 +1647,19 @@ mod tests {
         let tmp = std::env::temp_dir().join("rvt_export_src.csv");
         let mut f = File::create(&tmp).unwrap();
         f.write_all(b"name,age\nAlice,25\nBob,30\n").unwrap();
-        import_file(tmp.to_string_lossy().to_string()).unwrap();
+        import_csv(None, &tmp, "rvt_export_src", "rvt_export_src.csv", 8192).unwrap();
 
         let out = std::env::temp_dir().join("rvt_export_out");
         std::fs::create_dir_all(&out).unwrap();
 
         // 批量导出 csv
-        let res = export_files(ExportRequest {
+        let res = do_export(ExportRequest {
             keys: vec!["rvt_export_src.parquet".to_string()],
             format: "csv".to_string(),
             output_dir: out.to_string_lossy().to_string(),
             merge: false,
             file_name: None,
+            filters: vec![],
         })
         .unwrap();
         assert_eq!(res.total, 1);
@@ -1380,24 +1670,26 @@ mod tests {
         assert_eq!(&head[..3], b"\xEF\xBB\xBF", "CSV 缺少 UTF-8 BOM");
 
         // 合并导出 xlsx（每文件一个 sheet）
-        let res2 = export_files(ExportRequest {
+        let res2 = do_export(ExportRequest {
             keys: vec!["rvt_export_src.parquet".to_string()],
             format: "xlsx".to_string(),
             output_dir: out.to_string_lossy().to_string(),
             merge: true,
             file_name: None,
+            filters: vec![],
         })
         .unwrap();
         assert_eq!(res2.total, 1);
         assert!(out.join("合并导出.xlsx").exists());
 
         // 自定义合并导出文件名
-        let res3 = export_files(ExportRequest {
+        let res3 = do_export(ExportRequest {
             keys: vec!["rvt_export_src.parquet".to_string()],
             format: "xlsx".to_string(),
             output_dir: out.to_string_lossy().to_string(),
             merge: true,
             file_name: Some("汇总数据".to_string()),
+            filters: vec![],
         })
         .unwrap();
         assert_eq!(res3.total, 1);
@@ -1406,6 +1698,67 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_dir_all(&out);
         let _ = std::fs::remove_file(data_dir().unwrap().join("rvt_export_src.parquet"));
+    }
+
+    /// 带筛选的流式导出：CSV 与 parquet 都只导出匹配行
+    #[test]
+    fn export_with_filters_streaming() {
+        let tmp = std::env::temp_dir().join("rvt_export_filter.csv");
+        let mut f = File::create(&tmp).unwrap();
+        f.write_all(b"name,age\nAlice,25\nBob,30\nAnna,35\n").unwrap();
+        import_csv(None, &tmp, "rvt_export_filter", "rvt_export_filter.csv", 8192).unwrap();
+
+        let out = std::env::temp_dir().join("rvt_export_filter_out");
+        std::fs::create_dir_all(&out).unwrap();
+        let filters = vec![Filter {
+            field: Some(0),
+            value: Some("A".to_string()),
+        }];
+
+        // CSV 流式导出：表头 + Alice/Anna 2 行，不含 Bob
+        let res = do_export(ExportRequest {
+            keys: vec!["rvt_export_filter.parquet".to_string()],
+            format: "csv".to_string(),
+            output_dir: out.to_string_lossy().to_string(),
+            merge: false,
+            file_name: None,
+            filters,
+        })
+        .unwrap();
+        assert_eq!(res.total, 1);
+        let content = std::fs::read_to_string(out.join("rvt_export_filter.csv")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3, "应导出表头 + 2 行匹配，实际: {lines:?}");
+        assert!(content.contains("Alice") && content.contains("Anna"));
+        assert!(!content.contains("Bob"));
+
+        // parquet 流式导出：读回应 2 行
+        let res2 = do_export(ExportRequest {
+            keys: vec!["rvt_export_filter.parquet".to_string()],
+            format: "parquet".to_string(),
+            output_dir: out.to_string_lossy().to_string(),
+            merge: false,
+            file_name: None,
+            filters: vec![Filter {
+                field: Some(0),
+                value: Some("A".to_string()),
+            }],
+        })
+        .unwrap();
+        assert_eq!(res2.total, 1);
+        let p = out.join("rvt_export_filter.parquet");
+        let file = File::open(&p).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let reader = builder.build().unwrap();
+        let mut count = 0;
+        for b in reader {
+            count += b.unwrap().num_rows();
+        }
+        assert_eq!(count, 2, "带筛选的 parquet 应只含 2 行");
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&out);
+        let _ = std::fs::remove_file(data_dir().unwrap().join("rvt_export_filter.parquet"));
     }
 
     /// 合并导出时同名源文件的工作表名应去重
@@ -1509,7 +1862,7 @@ mod tests {
         f.write_all(b"name,age,score\nAlice,25,90.5\nBob,30,\n")
             .unwrap();
 
-        let results = import_file(tmp.to_string_lossy().to_string()).unwrap();
+        let results = import_csv(None, &tmp, "rvt_import_test", "rvt_import_test.csv", 8192).unwrap();
         assert_eq!(results.len(), 1);
         let res = &results[0];
         assert_eq!(res.columns, vec!["name", "age", "score"]);

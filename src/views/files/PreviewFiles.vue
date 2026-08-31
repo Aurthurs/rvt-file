@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useMessage } from "naive-ui";
 import { FilterOutline } from "@vicons/ionicons5";
@@ -53,6 +54,43 @@ interface FilterRow {
   value: string;
 }
 const filters = ref<FilterRow[]>([{ field: null, value: "" }]);
+
+/** 导入进度（后端 import-progress 事件） */
+interface ImportProgress {
+  source: string;
+  sheet: string;
+  /** 阶段："read" 解析源文件 / "write" 转换写 parquet */
+  stage: "read" | "write";
+  processed: number;
+  total: number;
+  sheet_index: number;
+  sheet_count: number;
+}
+const importProgress = ref<ImportProgress | null>(null);
+/** 导入进行中（区别于翻页的 loading）：期间全屏遮罩，禁止操作其他页面 */
+const importing = ref(false);
+/** 点击取消导入后置位，用于区分正常报错与主动取消 */
+const cancelling = ref(false);
+
+async function onCancelImport() {
+  cancelling.value = true;
+  try {
+    await invoke("cancel_import");
+  } catch {
+    /* 后端取消命令失败可忽略，导入循环仍会收到标志 */
+  }
+}
+const progressPercent = computed(() =>
+  importProgress.value?.total
+    ? Math.min(
+        100,
+        Math.round(
+          (importProgress.value.processed / importProgress.value.total) * 100
+        )
+      )
+    : 0
+);
+let unlistenImport: UnlistenFn | undefined;
 
 const hasAnyFilter = computed(() =>
   filters.value.some((f) => f.field !== null || f.value.trim())
@@ -223,6 +261,9 @@ function clearFilter() {
 }
 
 onMounted(async () => {
+  unlistenImport = await listen<ImportProgress>("import-progress", (e) => {
+    importProgress.value = e.payload;
+  });
   try {
     const metas = await invoke<
       { key: string; source: string; sheet: string }[]
@@ -245,7 +286,7 @@ onMounted(async () => {
   }
 });
 
-/** 导出当前预览的文件 */
+onUnmounted(() => unlistenImport?.());
 async function onExport(format: string) {
   if (!currentKey.value) {
     message.info("请先选择文件");
@@ -255,6 +296,10 @@ async function onExport(format: string) {
   if (!dir) return;
   exporting.value = true;
   try {
+    // 附带当前筛选条件：导出的是筛选后的数据
+    const reqFilters = filters.value
+      .filter((f) => f.value.trim())
+      .map((f) => ({ field: f.field, value: f.value.trim() }));
     await invoke("export_files", {
       req: {
         keys: [currentKey.value],
@@ -262,9 +307,14 @@ async function onExport(format: string) {
         output_dir: dir,
         merge: false,
         file_name: null,
+        filters: reqFilters,
       },
     });
-    message.success(`已导出到 ${dir}`);
+    message.success(
+      reqFilters.length
+        ? `已按筛选条件导出到 ${dir}`
+        : `已导出到 ${dir}`
+    );
   } catch (e) {
     message.error(String(e));
   } finally {
@@ -279,11 +329,15 @@ async function onUpload() {
   });
   if (!selected) return;
 
-  loading.value = true;
+  // 导入动画由全屏遮罩承担，不再触发按钮/表格的 loading
+  importing.value = true;
   errorMsg.value = "";
+  importProgress.value = null;
   try {
     for (const p of selected) {
-      const results = await invoke<ImportedFile[]>("import_file", { path: p });
+      const results = await invoke<ImportedFile[]>("import_file", {
+        req: { path: p, batch_rows: settings.value.batch_rows },
+      });
       for (const res of results) {
         let g = groups.value.find((x) => x.source === res.source);
         if (!g) {
@@ -302,10 +356,17 @@ async function onUpload() {
     page.value = 1;
     await loadPage();
   } catch (e) {
-    setError(e);
-    message.error(String(e));
+    if (cancelling.value) {
+      message.info("导入已取消");
+    } else {
+      setError(e);
+      message.error(String(e));
+    }
   } finally {
     loading.value = false;
+    importing.value = false;
+    cancelling.value = false;
+    importProgress.value = null;
   }
 }
 </script>
@@ -318,7 +379,7 @@ async function onUpload() {
 
     <div class="preview-card">
       <div class="toolbar">
-        <n-button type="primary" :loading="loading" @click="onUpload">
+        <n-button type="primary" @click="onUpload">
           上传文件
         </n-button>
         <n-select
@@ -418,6 +479,42 @@ async function onUpload() {
       <n-spin size="large" />
       <p class="export-text">正在导出，请稍候…</p>
     </div>
+
+    <!-- 导入遮罩：全屏覆盖（含侧边栏），期间无法操作其他页面 -->
+    <div v-if="importing" class="import-mask">
+      <div class="mask-card">
+        <n-spin size="large" />
+        <p class="mask-title">
+          {{ importProgress?.stage === "write" ? "正在转换" : "正在解析"
+          }}{{ importProgress ? ` ${importProgress.source}` : "" }}…
+        </p>
+        <template v-if="importProgress">
+          <!-- 转换阶段：显示行数进度条 -->
+          <n-progress
+            v-if="importProgress.stage === 'write' && importProgress.total"
+            type="line"
+            :percentage="progressPercent"
+            :show-indicator="true"
+            processing
+            :height="8"
+          />
+          <p v-else-if="importProgress.stage === 'write'" class="mask-sub">
+            已处理 {{ importProgress.processed.toLocaleString() }} 行，正在写入…
+          </p>
+          <!-- 解析阶段：无行进度，显示当前处理的表 -->
+          <p v-else class="mask-sub">
+            {{
+              importProgress.sheet_count > 1
+                ? `正在解析第 ${importProgress.sheet_index} / ${importProgress.sheet_count} 个表…`
+                : "正在解析源文件，请稍候…"
+            }}
+          </p>
+        </template>
+        <n-button secondary :loading="cancelling" @click="onCancelImport">
+          {{ cancelling ? "正在取消…" : "取消导入" }}
+        </n-button>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -464,6 +561,40 @@ async function onUpload() {
   padding: 12px;
   background: var(--brand-soft);
   border-radius: var(--radius-md);
+}
+
+/* 导入遮罩：全屏覆盖，禁止操作其他页面 */
+.import-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 2100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.mask-card {
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 28px 32px;
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+
+.mask-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.mask-sub {
+  font-size: 13px;
+  color: var(--text-muted);
 }
 
 .filter-head {

@@ -24,7 +24,8 @@ pub fn run() {
             importer::merge_files,
             importer::get_config,
             importer::save_config,
-            importer::set_window_theme
+            importer::set_window_theme,
+            importer::cancel_import
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
