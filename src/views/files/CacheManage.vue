@@ -32,6 +32,8 @@ function formatTime(ts: number) {
 
 /** 勾选的文件名 */
 const checkedKeys = ref<string[]>([]);
+/** 导出进行中（大文件导出时显示遮罩防止误操作） */
+const exporting = ref(false);
 
 const columns = [
   { type: "selection" as const },
@@ -158,6 +160,7 @@ async function onExport(format: string) {
   if (!checkedKeys.value.length) return;
   const dir = await open({ directory: true, title: "选择导出目录" });
   if (!dir) return;
+  exporting.value = true;
   try {
     const res = await invoke<{ exported: string[]; total: number }>(
       "export_files",
@@ -173,6 +176,8 @@ async function onExport(format: string) {
     message.success(`已导出 ${res.total} 个文件到 ${dir}`);
   } catch (e) {
     message.error(String(e));
+  } finally {
+    exporting.value = false;
   }
 }
 
@@ -180,6 +185,7 @@ async function onExport(format: string) {
 async function onExportSingle(entry: CacheEntry, format: string) {
   const dir = await open({ directory: true, title: "选择导出目录" });
   if (!dir) return;
+  exporting.value = true;
   try {
     await invoke<{ exported: string[]; total: number }>("export_files", {
       req: {
@@ -193,6 +199,8 @@ async function onExportSingle(entry: CacheEntry, format: string) {
     message.success(`已导出 ${entry.name}`);
   } catch (e) {
     message.error(String(e));
+  } finally {
+    exporting.value = false;
   }
 }
 
@@ -215,6 +223,7 @@ async function confirmExportMerge() {
   showNameModal.value = false;
   const dir = await open({ directory: true, title: "选择导出目录" });
   if (!dir) return;
+  exporting.value = true;
   try {
     const res = await invoke<{ exported: string[]; total: number }>(
       "export_files",
@@ -231,6 +240,8 @@ async function confirmExportMerge() {
     message.success(`已合并导出 ${res.total} 个文件到 ${dir}`);
   } catch (e) {
     message.error(String(e));
+  } finally {
+    exporting.value = false;
   }
 }
 
@@ -272,9 +283,14 @@ onMounted(refresh);
         <n-button :disabled="!checkedKeys.length" @click="onExportMerge">
           合并导出
         </n-button>
-        <n-button type="error" secondary :disabled="!entries.length" @click="onClear">
-          清空全部
-        </n-button>
+        <n-popconfirm @positive-click="onClear">
+          <template #trigger>
+            <n-button type="error" secondary :disabled="!entries.length">
+              清空全部
+            </n-button>
+          </template>
+          确认清空 data 目录下的所有缓存文件？此操作不可恢复。
+        </n-popconfirm>
         <span class="path">{{ dataPath }}</span>
       </div>
 
@@ -304,6 +320,10 @@ onMounted(refresh);
       />
     </n-modal>
 
+    <div v-if="exporting" class="export-mask">
+      <n-spin size="large" />
+      <p class="export-text">正在导出，请稍候…</p>
+    </div>
   </div>
 </template>
 
@@ -342,5 +362,23 @@ onMounted(refresh);
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 420px;
+}
+
+/* 导出遮罩：大文件导出时阻止误操作 */
+.export-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.export-text {
+  color: #fff;
+  font-size: 14px;
 }
 </style>

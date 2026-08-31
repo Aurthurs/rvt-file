@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray, StringBuilder};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
@@ -9,11 +9,10 @@ use arrow::record_batch::RecordBatch;
 use calamine::{open_workbook_auto, Data, Reader};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// 导入结果，rows 直接序列化为 JSON 供前端表格展示
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct ImportResult {
     pub key: String,
     pub source: String,
@@ -24,7 +23,7 @@ pub struct ImportResult {
 }
 
 /// 已导入文件元信息
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct ImportMeta {
     pub key: String,
     pub source: String,
@@ -45,11 +44,14 @@ fn data_dir() -> Result<std::path::PathBuf, String> {
 /// 读取源文件 -> 类型推断 -> 转 parquet 落盘 -> 返回表格数据
 type Manifest = HashMap<String, (String, String)>; // key -> (source, sheet)
 
+/// 保护 manifest.json 的并发读写（多命令/多线程安全）
+static MANIFEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn manifest_path() -> Result<std::path::PathBuf, String> {
     Ok(data_dir()?.join("manifest.json"))
 }
 
-fn load_manifest() -> Result<Manifest, String> {
+fn load_manifest_inner() -> Result<Manifest, String> {
     let p = manifest_path()?;
     if !p.exists() {
         return Ok(HashMap::new());
@@ -63,14 +65,21 @@ fn save_manifest(m: &Manifest) -> Result<(), String> {
     std::fs::write(manifest_path()?, s).map_err(|e| format!("保存清单失败: {e}"))
 }
 
+fn load_manifest() -> Result<Manifest, String> {
+    let _g = MANIFEST_LOCK.lock().map_err(|_| "清单锁失效".to_string())?;
+    load_manifest_inner()
+}
+
 fn update_manifest(key: &str, source: &str, sheet: &str) -> Result<(), String> {
-    let mut m = load_manifest()?;
+    let _g = MANIFEST_LOCK.lock().map_err(|_| "清单锁失效".to_string())?;
+    let mut m = load_manifest_inner()?;
     m.insert(key.to_string(), (source.to_string(), sheet.to_string()));
     save_manifest(&m)
 }
 
 fn remove_manifest(key: &str) -> Result<(), String> {
-    let mut m = load_manifest()?;
+    let _g = MANIFEST_LOCK.lock().map_err(|_| "清单锁失效".to_string())?;
+    let mut m = load_manifest_inner()?;
     m.remove(key);
     save_manifest(&m)
 }
@@ -166,7 +175,7 @@ fn build_import(
     let fields: Vec<Field> = columns
         .iter()
         .enumerate()
-        .map(|(i, name)| {
+        .map(|(_, name)| {
             let mut unique = name.clone();
             let mut n = 1;
             while used.contains(&unique) {
@@ -311,14 +320,14 @@ pub fn list_imported() -> Result<Vec<ImportMeta>, String> {
 }
 
 /// 单个筛选条件：field 为列索引（None 表示全部字段），value 为模糊关键字
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct Filter {
     pub field: Option<usize>,
     pub value: Option<String>,
 }
 
 /// 分页读取请求（单个结构体参数，避免 Tauri 多参数传递问题）
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct ReadRequest {
     pub key: String,
     pub offset: usize,
@@ -498,7 +507,7 @@ fn array_value(arr: &ArrayRef, i: usize) -> Value {
 }
 
 /// 缓存条目
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct CacheEntry {
     pub name: String,
     pub kind: String, // "file" | "dir"
@@ -506,7 +515,7 @@ pub struct CacheEntry {
     pub modified: i64,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct CacheInfo {
     pub path: String,
     pub entries: Vec<CacheEntry>,
@@ -573,7 +582,7 @@ pub fn delete_cache(name: String) -> Result<(), String> {
 }
 
 /// 导出请求
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct ExportRequest {
     pub keys: Vec<String>,
     pub format: String, // "csv" | "xlsx" | "parquet"
@@ -582,7 +591,7 @@ pub struct ExportRequest {
     pub file_name: Option<String>, // 合并导出时的自定义文件名
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct ExportResult {
     pub exported: Vec<String>,
     pub total: usize,
@@ -800,13 +809,13 @@ pub fn export_files(req: ExportRequest) -> Result<ExportResult, String> {
 }
 
 /// 质量检测请求
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct QualityRequest {
     pub key: String,
 }
 
 /// 单个字段的质量统计
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct FieldQuality {
     pub name: String,
     pub total: usize,
@@ -898,11 +907,321 @@ pub fn scan_quality(req: QualityRequest) -> Result<Vec<FieldQuality>, String> {
     Ok(results)
 }
 
+/// 连接字段映射：副文件字段 → 主文件字段
+#[derive(serde::Deserialize)]
+pub struct JoinPair {
+    pub sec_field: String,
+    pub main_field: String,
+}
+
+/// 融合文件输入：文件 + 连接字段映射（副文件字段 → 主文件字段）
+#[derive(serde::Deserialize)]
+pub struct MergeFileInput {
+    pub key: String,
+    pub joins: Vec<JoinPair>,
+}
+
+/// 数据融合请求：主文件 + 多个副文件按映射连接
+#[derive(serde::Deserialize)]
+pub struct MergeRequest {
+    pub main_key: String,
+    pub main_join_fields: Vec<String>,
+    pub secondaries: Vec<MergeFileInput>,
+    pub output_name: String,
+    pub join_type: String, // "inner" | "left" | "right"
+}
+
+/// 获取文件的列名（供前端选择连接字段）
+#[tauri::command]
+pub fn get_columns(key: String) -> Result<Vec<String>, String> {
+    let (columns, _) = read_table_full(&key)?;
+    Ok(columns)
+}
+
+/// join 键：拼接选中的字段值
+fn join_key(row: &[Value], idx: &[usize]) -> String {
+    idx.iter()
+        .map(|&i| value_to_string(row.get(i).unwrap_or(&Value::Null)))
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
+/// 写全字符串的 parquet 到 data/
+fn write_values_parquet(key: &str, columns: &[String], rows: &[Vec<Value>]) -> Result<(), String> {
+    let arrays: Vec<ArrayRef> = (0..columns.len())
+        .map(|i| {
+            let mut b = StringBuilder::new();
+            for row in rows {
+                match row.get(i).unwrap_or(&Value::Null) {
+                    Value::Null => b.append_null(),
+                    Value::String(s) => b.append_value(s),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        })
+        .collect();
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|c| Field::new(c.clone(), ArrowDataType::Utf8, true))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema, arrays).map_err(|e| format!("构建数据失败: {e}"))?;
+    let out_path = data_dir()?.join(key);
+    let file = File::create(&out_path).map_err(|e| format!("无法创建文件: {e}"))?;
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
+        .map_err(|e| format!("创建写入器失败: {e}"))?;
+    writer.write(&batch).map_err(|e| format!("写入失败: {e}"))?;
+    writer.close().map_err(|e| format!("保存失败: {e}"))?;
+    Ok(())
+}
+
+/// 数据融合：以主文件为基准 left join 多个副文件。
+/// 副文件同名字段按字母顺序加 A_/B_ 前缀区分（第一个副文件 A_，第二个 B_，依此类推）。
+#[tauri::command]
+pub fn merge_files(req: MergeRequest) -> Result<ImportResult, String> {
+    if req.main_join_fields.is_empty() {
+        return Err("主文件请至少选择一个连接字段".to_string());
+    }
+    if req.secondaries.is_empty() {
+        return Err("请至少选择一个副文件".to_string());
+    }
+    let join_type = req.join_type.as_str();
+    if !matches!(join_type, "inner" | "left" | "right") {
+        return Err("连接方式必须为 inner / left / right".to_string());
+    }
+
+    let (main_cols, main_rows) = read_table_full(&req.main_key)?;
+    let mut result_cols: Vec<String> = main_cols.clone();
+    let mut used: HashSet<String> = main_cols.iter().cloned().collect();
+
+    struct SecData {
+        fields: Vec<(usize, String)>, // (副文件列索引, 结果字段名)
+        rows: Vec<Vec<Value>>,
+        map: HashMap<String, usize>, // 副 join 键 -> 行
+        main_idx: Vec<usize>,        // 对应主文件列索引（按映射顺序）
+    }
+    let mut secs: Vec<SecData> = Vec::new();
+
+    for (i, sec_req) in req.secondaries.iter().enumerate() {
+        let prefix = (b'A' + i as u8) as char;
+        let (sec_cols, sec_rows) = read_table_full(&sec_req.key)?;
+        if sec_req.joins.is_empty() {
+            return Err(format!("副文件 {} 请至少配置一个连接字段", sec_req.key));
+        }
+        let sec_idx: Vec<usize> = sec_req
+            .joins
+            .iter()
+            .map(|j| {
+                sec_cols
+                    .iter()
+                    .position(|c| c == &j.sec_field)
+                    .ok_or_else(|| format!("副文件 {} 缺少字段: {}", sec_req.key, j.sec_field))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let main_idx: Vec<usize> = sec_req
+            .joins
+            .iter()
+            .map(|j| {
+                main_cols
+                    .iter()
+                    .position(|c| c == &j.main_field)
+                    .ok_or_else(|| format!("主文件缺少字段: {}", j.main_field))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let join_sec: HashSet<String> =
+            sec_req.joins.iter().map(|j| j.sec_field.clone()).collect();
+        let mut fields = Vec::new();
+        for (ci, col) in sec_cols.iter().enumerate() {
+            if join_sec.contains(col) {
+                continue;
+            }
+            let res_name = if used.contains(col) {
+                let mut candidate = format!("{prefix}_{col}");
+                let mut n = 1;
+                while used.contains(&candidate) {
+                    n += 1;
+                    candidate = format!("{prefix}_{n}_{col}");
+                }
+                candidate
+            } else {
+                col.clone()
+            };
+            used.insert(res_name.clone());
+            fields.push((ci, res_name));
+        }
+        result_cols.extend(fields.iter().map(|(_, n)| n.clone()));
+
+        let mut map: HashMap<String, usize> = HashMap::new();
+        for (ri, row) in sec_rows.iter().enumerate() {
+            map.entry(join_key(row, &sec_idx)).or_insert(ri);
+        }
+        secs.push(SecData {
+            fields,
+            rows: sec_rows,
+            map,
+            main_idx,
+        });
+    }
+
+    // 结果行总宽：主字段 + 各副字段
+    let total_len = main_cols.len() + secs.iter().map(|s| s.fields.len()).sum::<usize>();
+    let mut offsets = Vec::new();
+    let mut off = main_cols.len();
+    for s in &secs {
+        offsets.push(off);
+        off += s.fields.len();
+    }
+
+    // 主文件逐行连接
+    let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(main_rows.len());
+    for main_row in &main_rows {
+        let mut out: Vec<Value> = vec![Value::Null; total_len];
+        for (ci, v) in main_row.iter().enumerate() {
+            out[ci] = v.clone();
+        }
+        let mut all_match = true;
+        for (si, sec) in secs.iter().enumerate() {
+            let key = join_key(main_row, &sec.main_idx);
+            if let Some(&ri) = sec.map.get(&key) {
+                for (fi, &(sec_col, _)) in sec.fields.iter().enumerate() {
+                    out[offsets[si] + fi] =
+                        sec.rows[ri].get(sec_col).cloned().unwrap_or(Value::Null);
+                }
+            } else {
+                all_match = false;
+            }
+        }
+        // inner：副文件任一未匹配则丢弃该主行
+        if join_type == "inner" && !all_match {
+            continue;
+        }
+        result_rows.push(out);
+    }
+
+    // right：追加副文件中未匹配主文件的行（主字段为 null）
+    if join_type == "right" {
+        for (si, sec) in secs.iter().enumerate() {
+            let main_keys: HashSet<String> = main_rows
+                .iter()
+                .map(|r| join_key(r, &sec.main_idx))
+                .collect();
+            for (sec_key, &ri) in sec.map.iter() {
+                if !main_keys.contains(sec_key) {
+                    let mut out: Vec<Value> = vec![Value::Null; total_len];
+                    for (fi, &(sec_col, _)) in sec.fields.iter().enumerate() {
+                        out[offsets[si] + fi] =
+                            sec.rows[ri].get(sec_col).cloned().unwrap_or(Value::Null);
+                    }
+                    result_rows.push(out);
+                }
+            }
+        }
+    }
+
+    // 写 parquet + 注册 manifest
+    let out_name = {
+        let n = req.output_name.trim();
+        let base = if n.is_empty() { "融合结果" } else { n };
+        if base.ends_with(".parquet") {
+            base.to_string()
+        } else {
+            format!("{base}.parquet")
+        }
+    };
+    write_values_parquet(&out_name, &result_cols, &result_rows)?;
+    let _ = update_manifest(&out_name, &out_name, "");
+
+    Ok(ImportResult {
+        key: out_name.clone(),
+        source: out_name,
+        sheet: String::new(),
+        columns: result_cols,
+        rows: vec![],
+        row_count: result_rows.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
+    use serde_json::json;
     use std::io::Write;
+
+    /// 数据融合：主文件 left join 多个副文件，同名字段加前缀
+    #[test]
+    fn merge_files_works() {
+        let m = std::env::temp_dir().join("rvt_merge_main.csv");
+        let mut f = File::create(&m).unwrap();
+        f.write_all(b"id,name\n1,Alice\n2,Bob\n").unwrap();
+        import_file(m.to_string_lossy().to_string()).unwrap();
+
+        let a = std::env::temp_dir().join("rvt_merge_a.csv");
+        let mut f = File::create(&a).unwrap();
+        f.write_all(b"id,name,extra\n1,Al,X\n2,Bo,Y\n").unwrap();
+        import_file(a.to_string_lossy().to_string()).unwrap();
+
+        let b = std::env::temp_dir().join("rvt_merge_b.csv");
+        let mut f = File::create(&b).unwrap();
+        f.write_all(b"id,name\n1,A1\n2,B2\n").unwrap();
+        import_file(b.to_string_lossy().to_string()).unwrap();
+
+        let res = merge_files(MergeRequest {
+            main_key: "rvt_merge_main.parquet".to_string(),
+            main_join_fields: vec!["id".to_string()],
+            secondaries: vec![
+                MergeFileInput {
+                    key: "rvt_merge_a.parquet".to_string(),
+                    joins: vec![JoinPair {
+                        sec_field: "id".to_string(),
+                        main_field: "id".to_string(),
+                    }],
+                },
+                MergeFileInput {
+                    key: "rvt_merge_b.parquet".to_string(),
+                    joins: vec![JoinPair {
+                        sec_field: "id".to_string(),
+                        main_field: "id".to_string(),
+                    }],
+                },
+            ],
+            output_name: "融合测试".to_string(),
+            join_type: "left".to_string(),
+        })
+        .unwrap();
+
+        // 主 id,name + 副a name(冲突→A_name)/extra + 副b name(冲突→B_name)
+        assert_eq!(
+            res.columns,
+            vec!["id", "name", "A_name", "extra", "B_name"]
+        );
+        assert_eq!(res.row_count, 2);
+
+        // 读回验证数据
+        let back = read_parquet(ReadRequest {
+            key: "融合测试.parquet".to_string(),
+            offset: 0,
+            limit: 10,
+            filters: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            back.rows[0],
+            vec![json!("1"), json!("Alice"), json!("Al"), json!("X"), json!("A1")]
+        );
+        assert_eq!(
+            back.rows[1],
+            vec![json!("2"), json!("Bob"), json!("Bo"), json!("Y"), json!("B2")]
+        );
+
+        for p in ["rvt_merge_main.parquet", "rvt_merge_a.parquet", "rvt_merge_b.parquet", "融合测试.parquet"] {
+            let _ = std::fs::remove_file(data_dir().unwrap().join(p));
+        }
+        let _ = std::fs::remove_file(&m);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
 
     /// 质量检测：统计每个字段的非空、空值率、唯一值、极值
     #[test]

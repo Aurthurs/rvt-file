@@ -19,7 +19,9 @@ pub fn run() {
             importer::list_cache,
             importer::delete_cache,
             importer::export_files,
-            importer::scan_quality
+            importer::scan_quality,
+            importer::get_columns,
+            importer::merge_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

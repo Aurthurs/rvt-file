@@ -37,6 +37,13 @@ const total = ref(0);
 const page = ref(1);
 const pageSize = ref(10);
 const errorMsg = ref("");
+/** 导出进行中 */
+const exporting = ref(false);
+const exportOptions = [
+  { label: "CSV", key: "csv" },
+  { label: "Excel (.xlsx)", key: "xlsx" },
+  { label: "Parquet", key: "parquet" },
+];
 /** 多条件筛选：每行一个字段+值，全部条件 AND 同时满足 */
 interface FilterRow {
   field: number | null;
@@ -235,6 +242,33 @@ onMounted(async () => {
   }
 });
 
+/** 导出当前预览的文件 */
+async function onExport(format: string) {
+  if (!currentKey.value) {
+    message.info("请先选择文件");
+    return;
+  }
+  const dir = await open({ directory: true, title: "选择导出目录" });
+  if (!dir) return;
+  exporting.value = true;
+  try {
+    await invoke("export_files", {
+      req: {
+        keys: [currentKey.value],
+        format,
+        output_dir: dir,
+        merge: false,
+        file_name: null,
+      },
+    });
+    message.success(`已导出到 ${dir}`);
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    exporting.value = false;
+  }
+}
+
 async function onUpload() {
   const selected = await open({
     multiple: true,
@@ -300,6 +334,12 @@ async function onUpload() {
           :placeholder="'选择工作表'"
           @update:value="(s) => onSelectSheet(s as string)"
         />
+        <n-dropdown
+          :options="exportOptions"
+          @select="(k) => onExport(k as string)"
+        >
+          <n-button :disabled="!currentKey">导出</n-button>
+        </n-dropdown>
       </div>
 
       <div v-if="currentKey" class="filter-bar">
@@ -369,6 +409,11 @@ async function onUpload() {
           <p v-if="errorMsg" class="error-bar">加载失败：{{ errorMsg }}</p>
         </div>
       </n-spin>
+    </div>
+
+    <div v-if="exporting" class="export-mask">
+      <n-spin size="large" />
+      <p class="export-text">正在导出，请稍候…</p>
     </div>
   </div>
 </template>
@@ -487,5 +532,23 @@ async function onUpload() {
   color: #ef4444;
   background: rgba(239, 68, 68, 0.08);
   border-radius: var(--radius-sm);
+}
+
+/* 导出遮罩：大文件导出时阻止误操作 */
+.export-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.export-text {
+  color: #fff;
+  font-size: 14px;
 }
 </style>
