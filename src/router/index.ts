@@ -33,6 +33,11 @@ const router = createRouter({
       name: "files-cache",
       component: () => import("@views/files/CacheManage.vue"),
     },
+    {
+      path: "/settings",
+      name: "settings",
+      component: () => import("@views/Settings.vue"),
+    },
   ],
 });
 

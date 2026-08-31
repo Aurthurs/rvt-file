@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { NButton, NDropdown, NPopconfirm, NTag, useMessage } from "naive-ui";
 import { RefreshOutline } from "@vicons/ionicons5";
 import BackBar from "@components/common/BackBar.vue";
+import { useSettings } from "@/composables/useSettings";
 
 interface CacheEntry {
   name: string;
@@ -17,6 +18,7 @@ const message = useMessage();
 const loading = ref(false);
 const dataPath = ref("");
 const entries = ref<CacheEntry[]>([]);
+const { settings } = useSettings();
 
 function formatSize(n: number) {
   if (n < 1024) return `${n} B`;
@@ -300,7 +302,7 @@ onMounted(refresh);
         :data="entries"
         :row-key="(row: CacheEntry) => row.name"
         v-model:checked-row-keys="checkedKeys"
-        :pagination="{ pageSize: 10 }"
+        :pagination="{ pageSize: settings.page_size }"
         :loading="loading"
       />
     </div>

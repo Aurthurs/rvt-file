@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useMessage } from "naive-ui";
 import { FilterOutline } from "@vicons/ionicons5";
 import BackBar from "@components/common/BackBar.vue";
+import { useSettings } from "@/composables/useSettings";
 
 interface ImportedFile {
   key: string;
@@ -35,7 +36,9 @@ const columns = ref<string[]>([]);
 const rows = ref<(string | number | null)[][]>([]);
 const total = ref(0);
 const page = ref(1);
-const pageSize = ref(10);
+const { settings } = useSettings();
+/** 默认分页大小来自全局设置 */
+const pageSize = ref(settings.value.page_size);
 const errorMsg = ref("");
 /** 导出进行中 */
 const exporting = ref(false);

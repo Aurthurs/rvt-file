@@ -34,7 +34,7 @@
 
 <script setup lang="ts">
 import { computed, h } from "vue";
-import { NButton, NIcon, NMenu, useMessage } from "naive-ui";
+import { NButton, NIcon, NMenu } from "naive-ui";
 import { useRoute, useRouter } from "vue-router";
 import {
   FolderOpenOutline,
@@ -47,7 +47,6 @@ import {
 defineProps<{ dark: boolean }>();
 const emit = defineEmits<{ "update:dark": [v: boolean] }>();
 
-const message = useMessage();
 const route = useRoute();
 const router = useRouter();
 
@@ -78,7 +77,7 @@ const activeKey = computed(() => {
 function onSelect(key: string) {
   if (key === "dashboard") router.push("/");
   else if (key === "files") router.push("/files");
-  else message.info("设置页开发中");
+  else if (key === "settings") router.push("/settings");
 }
 </script>
 

@@ -10,6 +10,7 @@ use calamine::{open_workbook_auto, Data, Reader};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use serde_json::Value;
+use tauri::Manager;
 
 /// 导入结果，rows 直接序列化为 JSON 供前端表格展示
 #[derive(serde::Serialize)]
@@ -1141,6 +1142,100 @@ pub fn merge_files(req: MergeRequest) -> Result<ImportResult, String> {
         rows: vec![],
         row_count: result_rows.len(),
     })
+}
+
+/// 全局设置：主题 + 默认值，持久化到 app_config_dir/settings.json
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    /// 主题："light" | "dark"
+    pub theme: String,
+    /// 表格默认分页大小
+    pub page_size: usize,
+    /// 工作台快捷入口的功能 key 列表；为空则显示全部
+    pub quick_entries: Vec<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme: "light".to_string(),
+            page_size: 10,
+            quick_entries: vec![],
+        }
+    }
+}
+
+fn config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("无法定位配置目录: {e}"))?;
+    Ok(dir.join("settings.json"))
+}
+
+#[tauri::command]
+pub fn get_config(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    let p = config_path(&app)?;
+    if !p.exists() {
+        return Ok(AppSettings::default());
+    }
+    let s = std::fs::read_to_string(&p).map_err(|e| format!("读取配置失败: {e}"))?;
+    serde_json::from_str(&s).map_err(|e| format!("配置格式错误: {e}"))
+}
+
+#[tauri::command]
+pub fn save_config(app: tauri::AppHandle, req: AppSettings) -> Result<(), String> {
+    let p = config_path(&app)?;
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    let s = serde_json::to_string_pretty(&req).map_err(|e| e.to_string())?;
+    std::fs::write(&p, s).map_err(|e| format!("保存配置失败: {e}"))
+}
+
+/// 窗口主题请求
+#[derive(serde::Deserialize)]
+pub struct WindowTheme {
+    pub dark: bool,
+}
+
+// 切换 Windows 系统标题栏（关闭/最小化/最大化区域）明暗。
+// 不依赖 Tauri 的 set_theme（Windows 上部分支持），直接用
+// DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE) 硬切。
+#[cfg(windows)]
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: *const core::ffi::c_void,
+        attr: u32,
+        pv: *const core::ffi::c_void,
+        cb: u32,
+    ) -> i32;
+}
+
+#[tauri::command]
+pub fn set_window_theme(window: tauri::Window, req: WindowTheme) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // HWND 是 `#[repr(transparent)]` 的裸指针包装，取 .0 传给 DwmSetWindowAttribute
+        let hwnd = window.hwnd().map_err(|e| format!("获取窗口句柄失败: {e}"))?;
+        // DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        let dark: i32 = if req.dark { 1 } else { 0 };
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd.0 as *const core::ffi::c_void,
+                20,
+                &dark as *const i32 as *const core::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, req);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

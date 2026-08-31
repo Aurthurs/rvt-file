@@ -17,17 +17,33 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from "vue";
-import { darkTheme, dateZhCN, useOsTheme, zhCN } from "naive-ui";
+import { computed, onMounted, watch } from "vue";
+import { darkTheme, dateZhCN, zhCN } from "naive-ui";
+import { invoke } from "@tauri-apps/api/core";
 import AppSidebar from "@components/layout/AppSidebar.vue";
 import { darkThemeOverrides, lightThemeOverrides } from "@styles/theme";
+import { loadSettings, saveSettings, useSettings } from "@/composables/useSettings";
 
-const isDark = ref(useOsTheme().value === "dark");
+const { settings } = useSettings();
+
+/** 主题唯一状态：写入 settings 并立即持久化 */
+const isDark = computed({
+  get: () => settings.value.theme === "dark",
+  set: (v: boolean) => {
+    settings.value.theme = v ? "dark" : "light";
+    saveSettings();
+  },
+});
+
+onMounted(loadSettings);
 
 watch(
-  isDark,
-  (v) => {
+  () => settings.value.theme,
+  (t) => {
+    const v = t === "dark";
     document.documentElement.dataset.theme = v ? "dark" : "light";
+    // 硬切 Windows 系统标题栏明暗（Tauri setTheme 在 Windows 上不可靠）
+    invoke("set_window_theme", { req: { dark: v } }).catch(() => {});
   },
   { immediate: true }
 );

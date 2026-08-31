@@ -217,7 +217,7 @@ async function onMerge() {
           :value="mainJoinFields"
           class="join-select main-join"
           multiple
-          :bordered="false"
+          :bordered="true"
           :options="mainCols.map((c) => ({ label: c, value: c }))"
           placeholder="选择连接字段"
           @update:value="(v) => onMainJoinFields(v as string[])"
