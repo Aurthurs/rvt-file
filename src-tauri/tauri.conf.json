@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "rvt-file",
+  "productName": "RVT",
   "version": "1.0.0",
   "identifier": "com.tauri-app.rvt-file",
   "build": {
@@ -24,8 +24,18 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      }
+    },
     "icon": [
-      "icons/unicorn.svg"
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
     ]
   }
 }

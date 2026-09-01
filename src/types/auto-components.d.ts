@@ -14,8 +14,6 @@ declare module 'vue' {
     AppSidebar: typeof import('./../components/layout/AppSidebar.vue')['default']
     BackBar: typeof import('./../components/common/BackBar.vue')['default']
     NButton: typeof import('naive-ui')['NButton']
-    NCheckbox: typeof import('naive-ui')['NCheckbox']
-    NCheckboxGroup: typeof import('naive-ui')['NCheckboxGroup']
     NConfigProvider: typeof import('naive-ui')['NConfigProvider']
     NDataTable: typeof import('naive-ui')['NDataTable']
     NDropdown: typeof import('naive-ui')['NDropdown']
