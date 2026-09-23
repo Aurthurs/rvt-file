@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { useRoute } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -28,6 +29,7 @@ interface FileGroup {
 }
 
 const message = useMessage();
+const route = useRoute();
 const loading = ref(false);
 /** 文件组：按源文件分组，每组含多个 sheet 的 parquet */
 const groups = ref<FileGroup[]>([]);
@@ -48,12 +50,29 @@ const exportOptions = [
   { label: "Excel (.xlsx)", key: "xlsx" },
   { label: "Parquet", key: "parquet" },
 ];
-/** 多条件筛选：每行一个字段+值，全部条件 AND 同时满足 */
+/** 多条件筛选：每行一个字段+操作符+值，全部条件 AND 同时满足 */
 interface FilterRow {
   field: number | null;
   value: string;
+  /** 匹配操作符，与后端 Filter.op 一致 */
+  op: string;
 }
-const filters = ref<FilterRow[]>([{ field: null, value: "" }]);
+const filters = ref<FilterRow[]>([
+  { field: null, value: "", op: "contains" },
+]);
+
+/** 筛选操作符选项 */
+const opOptions = [
+  { label: "包含", value: "contains" },
+  { label: "等于", value: "eq" },
+  { label: "不等于", value: "ne" },
+  { label: "大于", value: "gt" },
+  { label: "大于等于", value: "ge" },
+  { label: "小于", value: "lt" },
+  { label: "小于等于", value: "le" },
+  { label: "开头是", value: "starts" },
+  { label: "结尾是", value: "ends" },
+];
 
 /** 导入进度（后端 import-progress 事件） */
 interface ImportProgress {
@@ -170,7 +189,7 @@ async function loadPage() {
   try {
     const reqFilters = filters.value
       .filter((f) => f.value.trim())
-      .map((f) => ({ field: f.field, value: f.value.trim() }));
+      .map((f) => ({ field: f.field, value: f.value.trim(), op: f.op }));
     const res = await invoke<ImportedFile>("read_parquet", {
       req: {
         key,
@@ -227,14 +246,14 @@ function onValueInput(idx: number, v: string) {
 }
 
 function addFilter() {
-  filters.value.push({ field: null, value: "" });
+  filters.value.push({ field: null, value: "", op: "contains" });
 }
 
 function removeFilter(idx: number) {
   if (filters.value.length > 1) {
     filters.value.splice(idx, 1);
   } else {
-    filters.value[0] = { field: null, value: "" };
+    filters.value[0] = { field: null, value: "", op: "contains" };
   }
 }
 
@@ -250,7 +269,7 @@ function applyFilter() {
 
 /** 仅重置筛选条件（不加载，供切换文件/sheet 时复用） */
 function resetFilter() {
-  filters.value = [{ field: null, value: "" }];
+  filters.value = [{ field: null, value: "", op: "contains" }];
 }
 
 /** 清除筛选并重新加载全部数据 */
@@ -276,8 +295,21 @@ onMounted(async () => {
     }
     groups.value = [...map.values()];
     if (groups.value.length) {
-      selectedSource.value = groups.value[0].source;
-      selectedSheet.value = groups.value[0].sheets[0].sheet;
+      // 支持 /files/preview?key=xxx 直达指定文件（如翻译完成跳转）
+      const q = route.query.key;
+      let target = groups.value[0];
+      if (typeof q === "string") {
+        const hit = groups.value.find((g) =>
+          g.sheets.some((s) => s.key === q)
+        );
+        if (hit) target = hit;
+      }
+      selectedSource.value = target.source;
+      selectedSheet.value = target.sheets[0]?.sheet ?? "";
+      if (typeof q === "string") {
+        const s = target.sheets.find((x) => x.key === q);
+        if (s) selectedSheet.value = s.sheet;
+      }
       loadPage();
     }
   } catch (e) {
@@ -299,7 +331,7 @@ async function onExport(format: string) {
     // 附带当前筛选条件：导出的是筛选后的数据
     const reqFilters = filters.value
       .filter((f) => f.value.trim())
-      .map((f) => ({ field: f.field, value: f.value.trim() }));
+      .map((f) => ({ field: f.field, value: f.value.trim(), op: f.op }));
     await invoke("export_files", {
       req: {
         keys: [currentKey.value],
@@ -419,6 +451,12 @@ async function onUpload() {
             placeholder="选择字段（可选）"
             clearable
             @update:value="(v) => onFieldInput(idx, v as number | null)"
+          />
+          <n-select
+            :value="f.op"
+            class="filter-op"
+            :options="opOptions"
+            @update:value="(v) => (filters[idx].op = String(v))"
           />
           <n-input
             :value="f.value"
@@ -628,11 +666,15 @@ async function onUpload() {
 }
 
 .filter-field {
-  width: 160px;
+  width: 150px;
+}
+
+.filter-op {
+  width: 100px;
 }
 
 .filter-value {
-  width: 220px;
+  width: 200px;
 }
 
 .row-count {

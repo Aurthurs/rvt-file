@@ -482,11 +482,49 @@ pub fn list_imported() -> Result<Vec<ImportMeta>, String> {
         .collect())
 }
 
-/// 单个筛选条件：field 为列索引（None 表示全部字段），value 为模糊关键字
+/// 单个筛选条件：field 为列索引（None 表示全部字段），value 为关键字，op 为匹配操作符
 #[derive(serde::Deserialize)]
 pub struct Filter {
     pub field: Option<usize>,
     pub value: Option<String>,
+    /// 匹配操作符：contains(默认) | eq | ne | gt | ge | lt | le | starts | ends
+    #[serde(default)]
+    pub op: String,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self {
+            field: None,
+            value: None,
+            op: "contains".to_string(),
+        }
+    }
+}
+
+/// 单元格值按操作符匹配（统一大小写不敏感）
+fn str_matches(cell: &str, op: &str, kw: &str) -> bool {
+    let lc = cell.to_lowercase();
+    let k = kw.to_lowercase();
+    match op {
+        "eq" => lc == k,
+        "ne" => lc != k,
+        "starts" => lc.starts_with(&k),
+        "ends" => lc.ends_with(&k),
+        "gt" => matches_ord(&lc, &k, |o| o.is_gt()),
+        "ge" => matches_ord(&lc, &k, |o| o.is_ge()),
+        "lt" => matches_ord(&lc, &k, |o| o.is_lt()),
+        "le" => matches_ord(&lc, &k, |o| o.is_le()),
+        _ => lc.contains(&k), // contains 及空值默认
+    }
+}
+
+/// 大于/小于类比较：双方都能解析为数值时按数值，否则按字符串字典序
+fn matches_ord(cell_lc: &str, kw_lc: &str, pick: fn(std::cmp::Ordering) -> bool) -> bool {
+    match (cell_lc.parse::<f64>(), kw_lc.parse::<f64>()) {
+        (Ok(a), Ok(b)) => a.partial_cmp(&b).map(pick).unwrap_or(false),
+        _ => pick(cell_lc.cmp(kw_lc)),
+    }
 }
 
 /// 分页读取请求（单个结构体参数，避免 Tauri 多参数传递问题）
@@ -548,13 +586,14 @@ pub fn read_parquet(req: ReadRequest) -> Result<ImportResult, String> {
                     let Some(raw) = f.value.as_deref() else {
                         return true;
                     };
-                    let kw = raw.trim().to_lowercase();
+                    let kw = raw.trim();
                     if kw.is_empty() {
                         return true;
                     }
+                    let op = if f.op.is_empty() { "contains" } else { f.op.as_str() };
                     match f.field {
-                        Some(fi) => row_matches(&batch, i, fi, &kw),
-                        None => row_matches_any(&batch, i, &kw, num_cols),
+                        Some(fi) => row_matches(&batch, i, fi, op, kw),
+                        None => row_matches_any(&batch, i, op, kw, num_cols),
                     }
                 });
                 if !pass {
@@ -600,32 +639,33 @@ pub fn read_parquet(req: ReadRequest) -> Result<ImportResult, String> {
     })
 }
 
-/// 任一列命中即匹配（全局模糊搜索）
-fn row_matches_any(batch: &RecordBatch, i: usize, fv: &str, num_cols: usize) -> bool {
-    (0..num_cols).any(|c| row_matches(batch, i, c, fv))
+/// 任一列命中即匹配（全局搜索）
+fn row_matches_any(batch: &RecordBatch, i: usize, op: &str, kw: &str, num_cols: usize) -> bool {
+    (0..num_cols).any(|c| row_matches(batch, i, c, op, kw))
 }
 
-/// arrow 层的字段值模糊匹配，避免为全表构建 JSON
-fn row_matches(batch: &RecordBatch, i: usize, col: usize, fv: &str) -> bool {
+/// arrow 层的字段值按操作符匹配，避免为全表构建 JSON；null 不匹配
+fn row_matches(batch: &RecordBatch, i: usize, col: usize, op: &str, kw: &str) -> bool {
     let arr = batch.column(col);
-    match arr.data_type() {
+    let s: Option<String> = match arr.data_type() {
         ArrowDataType::Utf8 => arr
             .as_any()
             .downcast_ref::<StringArray>()
-            .map(|a| a.is_valid(i) && a.value(i).to_lowercase().contains(fv))
-            .unwrap_or(false),
+            .map(|a| a.is_valid(i).then(|| a.value(i).to_string()))
+            .flatten(),
         ArrowDataType::Int64 => arr
             .as_any()
             .downcast_ref::<Int64Array>()
-            .map(|a| a.is_valid(i) && a.value(i).to_string().contains(fv))
-            .unwrap_or(false),
+            .map(|a| a.is_valid(i).then(|| a.value(i).to_string()))
+            .flatten(),
         ArrowDataType::Float64 => arr
             .as_any()
             .downcast_ref::<Float64Array>()
-            .map(|a| a.is_valid(i) && a.value(i).to_string().contains(fv))
-            .unwrap_or(false),
-        _ => false,
-    }
+            .map(|a| a.is_valid(i).then(|| a.value(i).to_string()))
+            .flatten(),
+        _ => None,
+    };
+    s.map(|v| str_matches(&v, op, kw)).unwrap_or(false)
 }
 
 fn array_value(arr: &ArrayRef, i: usize) -> Value {
@@ -803,16 +843,21 @@ fn value_to_string(v: &Value) -> String {
     }
 }
 
-/// 行是否满足全部筛选条件（与 read_parquet 的模糊匹配语义一致）
+/// 行是否满足全部筛选条件（与 read_parquet 的匹配语义一致）
 fn row_matches_filters(row: &[Value], filters: &[Filter]) -> bool {
     filters.iter().all(|f| {
-        let kw = f.value.as_deref().unwrap_or("");
+        let kw = f.value.as_deref().unwrap_or("").trim();
         if kw.is_empty() {
             return true;
         }
+        let op = if f.op.is_empty() { "contains" } else { f.op.as_str() };
+        let cell_match = |v: &Value| match v {
+            Value::Null => false,
+            other => str_matches(&value_to_string(other), op, kw),
+        };
         match f.field {
-            Some(col) => value_to_string(row.get(col).unwrap_or(&Value::Null)).contains(kw),
-            None => row.iter().any(|c| value_to_string(c).contains(kw)),
+            Some(col) => cell_match(row.get(col).unwrap_or(&Value::Null)),
+            None => row.iter().any(cell_match),
         }
     })
 }
@@ -1430,6 +1475,286 @@ pub fn merge_files(req: MergeRequest) -> Result<ImportResult, String> {
     })
 }
 
+/// 单个字典翻译步骤
+#[derive(serde::Deserialize)]
+pub struct TranslateStep {
+    /// 字典文件 key
+    pub dict_key: String,
+    /// 字典匹配列（原文词）
+    pub dict_from: String,
+    /// 字典译文列（翻译结果）
+    pub dict_to: String,
+}
+
+/// 单个字段的翻译配置：被翻译列 + 字典链（按顺序链式）
+#[derive(serde::Deserialize)]
+pub struct TranslateField {
+    /// 被翻译列（命中直接覆盖该列，未命中保留原值）
+    pub from: String,
+    /// 该字段的字典链（按添加顺序执行，每轮读该列当前值）
+    pub steps: Vec<TranslateStep>,
+}
+
+/// 字典翻译请求：多个字段各自独立翻译，单遍流式处理
+#[derive(serde::Deserialize)]
+pub struct TranslateRequest {
+    /// 目标文件 key
+    pub target_key: String,
+    /// 字段翻译列表
+    pub fields: Vec<TranslateField>,
+    /// 输出文件名
+    pub output_name: String,
+}
+
+/// 单轮翻译统计
+#[derive(serde::Serialize)]
+pub struct TranslateRound {
+    pub dict: String,
+    pub matched: usize,
+}
+
+/// 单个字段的翻译统计
+#[derive(serde::Serialize)]
+pub struct TranslateFieldResult {
+    pub from: String,
+    pub rounds: Vec<TranslateRound>,
+}
+
+#[derive(serde::Serialize)]
+pub struct TranslateResult {
+    pub key: String,
+    pub total: usize,
+    pub fields: Vec<TranslateFieldResult>,
+}
+
+/// 读字典建映射：重复键保留首个（与 VLOOKUP 一致），空键跳过
+fn build_dict_map(step: &TranslateStep) -> Result<HashMap<String, String>, String> {
+    let (dict_cols, dict_rows) = read_table_full(&step.dict_key)?;
+    let dict_from = dict_cols
+        .iter()
+        .position(|c| c == &step.dict_from)
+        .ok_or_else(|| format!("字典缺少匹配列: {}", step.dict_from))?;
+    let dict_to = dict_cols
+        .iter()
+        .position(|c| c == &step.dict_to)
+        .ok_or_else(|| format!("字典缺少译文列: {}", step.dict_to))?;
+    let mut map: HashMap<String, String> = HashMap::new();
+    for row in &dict_rows {
+        let k = value_to_string(row.get(dict_from).unwrap_or(&Value::Null));
+        if k.is_empty() {
+            continue;
+        }
+        let v = value_to_string(row.get(dict_to).unwrap_or(&Value::Null));
+        map.entry(k).or_insert(v);
+    }
+    Ok(map)
+}
+
+/// 字段翻译计划：列索引 + 字典链 + 每轮匹配计数
+struct FieldPlan {
+    from_name: String,
+    from_idx: usize,
+    maps: Vec<HashMap<String, String>>,
+    dict_names: Vec<String>,
+    matched: Vec<usize>,
+}
+
+/// 字典翻译：一次流式读取目标文件，每行对每个字段按其字典链顺序应用
+/// （首轮读被翻译列，后续轮读翻译列的当前值），结果写入新 parquet（原文件不动）。
+#[tauri::command]
+pub async fn translate_file(
+    app: tauri::AppHandle,
+    req: TranslateRequest,
+) -> Result<TranslateResult, String> {
+    IMPORT_CANCEL.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || do_translate(&app, req))
+        .await
+        .map_err(|e| format!("翻译任务异常: {e}"))?
+}
+
+fn do_translate(app: &tauri::AppHandle, req: TranslateRequest) -> Result<TranslateResult, String> {
+    if req.fields.is_empty() {
+        return Err("请至少添加一个翻译字段".to_string());
+    }
+    for f in &req.fields {
+        if f.steps.is_empty() {
+            return Err(format!("字段 {} 请至少添加一个字典", f.from));
+        }
+    }
+    let out_name = {
+        let n = req.output_name.trim();
+        let base = if n.is_empty() { "翻译结果" } else { n };
+        if base.ends_with(".parquet") {
+            base.to_string()
+        } else {
+            format!("{base}.parquet")
+        }
+    };
+
+    // 1. read 阶段：逐个加载字典建映射
+    let total_dicts: usize = req.fields.iter().map(|f| f.steps.len()).sum();
+    let mut loaded = 0usize;
+    let mut dict_maps: Vec<Vec<HashMap<String, String>>> = Vec::with_capacity(req.fields.len());
+    let mut dict_names: Vec<Vec<String>> = Vec::with_capacity(req.fields.len());
+    for f in &req.fields {
+        let mut maps = Vec::with_capacity(f.steps.len());
+        let mut names = Vec::with_capacity(f.steps.len());
+        for step in &f.steps {
+            if IMPORT_CANCEL.load(Ordering::Relaxed) {
+                return Err("翻译已取消".to_string());
+            }
+            loaded += 1;
+            emit_progress(
+                app,
+                &ImportProgress {
+                    source: req.target_key.clone(),
+                    sheet: step.dict_key.clone(),
+                    stage: "read".to_string(),
+                    processed: 0,
+                    total: 0,
+                    sheet_index: loaded,
+                    sheet_count: total_dicts,
+                },
+            );
+            maps.push(build_dict_map(step)?);
+            names.push(step.dict_key.clone());
+        }
+        dict_maps.push(maps);
+        dict_names.push(names);
+    }
+
+    // 2. 打开目标文件，校验列并构建计划
+    let path = data_dir()?.join(&req.target_key);
+    let file = File::open(&path).map_err(|e| format!("无法打开文件: {e}"))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| format!("读取失败: {e}"))?;
+    let total = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    let columns: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    let mut plans = Vec::with_capacity(req.fields.len());
+    for (idx, (f, maps)) in req.fields.iter().zip(dict_maps).enumerate() {
+        let from_idx = columns
+            .iter()
+            .position(|c| c == &f.from)
+            .ok_or_else(|| format!("目标文件缺少被翻译列: {}", f.from))?;
+        plans.push(FieldPlan {
+            from_name: f.from.clone(),
+            from_idx,
+            matched: vec![0; maps.len()],
+            dict_names: std::mem::take(&mut dict_names[idx]),
+            maps,
+        });
+    }
+
+    // 3. write 阶段：单遍流式处理
+    let reader = builder.build().map_err(|e| format!("解析失败: {e}"))?;
+    let num_cols = columns.len();
+    const BATCH: usize = 8192;
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|c| Field::new(c, ArrowDataType::Utf8, true))
+            .collect::<Vec<Field>>(),
+    ));
+    let out_path = data_dir()?.join(&out_name);
+    let out_file = File::create(&out_path).map_err(|e| format!("无法创建文件: {e}"))?;
+    let mut writer = ArrowWriter::try_new(out_file, schema.clone(), None)
+        .map_err(|e| format!("创建写入器失败: {e}"))?;
+
+    let outcome = (move || -> Result<Vec<FieldPlan>, String> {
+        let mut builders: Vec<StringBuilder> =
+            columns.iter().map(|_| StringBuilder::new()).collect();
+        let mut buffered = 0usize;
+        let mut processed = 0usize;
+        for batch in reader {
+            if IMPORT_CANCEL.load(Ordering::Relaxed) {
+                return Err("翻译已取消".to_string());
+            }
+            let batch = batch.map_err(|e| format!("读取数据失败: {e}"))?;
+            for i in 0..batch.num_rows() {
+                let mut row: Vec<Value> = (0..num_cols)
+                    .map(|c| array_value(batch.column(c), i))
+                    .collect();
+                processed += 1;
+                // 每个字段按字典链顺序应用：每轮读该列当前值，命中直接覆盖
+                for plan in plans.iter_mut() {
+                    let col = plan.from_idx;
+                    for (r, map) in plan.maps.iter().enumerate() {
+                        let k = value_to_string(row.get(col).unwrap_or(&Value::Null));
+                        if !k.is_empty() {
+                            if let Some(v) = map.get(&k).cloned() {
+                                row[col] = Value::String(v);
+                                plan.matched[r] += 1;
+                            }
+                        }
+                    }
+                }
+                for (c, v) in row.iter().enumerate() {
+                    match v {
+                        Value::Null => builders[c].append_null(),
+                        Value::String(s) => builders[c].append_value(s),
+                        _ => builders[c].append_null(),
+                    }
+                }
+                buffered += 1;
+                if buffered >= BATCH {
+                    flush_batch(&mut writer, &schema, &mut builders)?;
+                    buffered = 0;
+                }
+            }
+            emit_progress(
+                app,
+                &ImportProgress {
+                    source: req.target_key.clone(),
+                    sheet: String::new(),
+                    stage: "write".to_string(),
+                    processed,
+                    total,
+                    sheet_index: 1,
+                    sheet_count: 1,
+                },
+            );
+        }
+        flush_batch(&mut writer, &schema, &mut builders)?;
+        writer
+            .close()
+            .map_err(|e| format!("保存失败: {e}"))?;
+        Ok(plans)
+    })();
+
+    let plans = match outcome {
+        Ok(p) => p,
+        Err(e) => {
+            // writer 已随闭包退出 drop，文件句柄释放后删除半成品
+            let _ = std::fs::remove_file(&out_path);
+            return Err(e);
+        }
+    };
+
+    let _ = update_manifest(&out_name, &out_name, "");
+    let field_results: Vec<TranslateFieldResult> = plans
+        .into_iter()
+        .map(|p| TranslateFieldResult {
+            from: p.from_name,
+            rounds: p
+                .dict_names
+                .into_iter()
+                .zip(p.matched)
+                .map(|(dict, matched)| TranslateRound { dict, matched })
+                .collect(),
+        })
+        .collect();
+    Ok(TranslateResult {
+        key: out_name,
+        total,
+        fields: field_results,
+    })
+}
+
 /// 全局设置：主题 + 默认值，持久化到 app_config_dir/settings.json
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -1713,6 +2038,7 @@ mod tests {
         let filters = vec![Filter {
             field: Some(0),
             value: Some("A".to_string()),
+            ..Filter::default()
         }];
 
         // CSV 流式导出：表头 + Alice/Anna 2 行，不含 Bob
@@ -1742,6 +2068,7 @@ mod tests {
             filters: vec![Filter {
                 field: Some(0),
                 value: Some("A".to_string()),
+                ..Filter::default()
             }],
         })
         .unwrap();
@@ -1819,6 +2146,7 @@ mod tests {
                 filters: vec![Filter {
                     field: Some(fi),
                     value: Some("3".to_string()),
+                    ..Filter::default()
                 }],
             })
             .unwrap();
@@ -1897,6 +2225,7 @@ mod tests {
             filters: vec![Filter {
                 field: Some(0),
                 value: Some("ali".to_string()),
+                ..Filter::default()
             }],
         })
         .unwrap();

@@ -24,6 +24,11 @@ const router = createRouter({
       component: () => import("@views/files/MergeFiles.vue"),
     },
     {
+      path: "/files/translate",
+      name: "files-translate",
+      component: () => import("@views/files/TranslateFiles.vue"),
+    },
+    {
       path: "/files/quality",
       name: "files-quality",
       component: () => import("@views/files/QualityCheck.vue"),

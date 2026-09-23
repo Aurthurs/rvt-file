@@ -4,6 +4,7 @@ import {
   ArchiveOutline,
   EyeOutline,
   GitMergeOutline,
+  LanguageOutline,
   ShieldCheckmarkOutline,
 } from "@vicons/ionicons5";
 
@@ -21,6 +22,12 @@ const cards = [
     desc: "合并多个文件",
     icon: GitMergeOutline,
     to: "/files/merge",
+  },
+  {
+    title: "文件翻译",
+    desc: "按字典映射批量更新译文列",
+    icon: LanguageOutline,
+    to: "/files/translate",
   },
   {
     title: "质量检测",

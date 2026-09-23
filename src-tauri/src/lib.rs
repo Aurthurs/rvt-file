@@ -22,6 +22,7 @@ pub fn run() {
             importer::scan_quality,
             importer::get_columns,
             importer::merge_files,
+            importer::translate_file,
             importer::get_config,
             importer::save_config,
             importer::set_window_theme,
