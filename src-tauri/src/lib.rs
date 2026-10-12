@@ -11,6 +11,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             greet,
             importer::import_file,
@@ -23,6 +24,14 @@ pub fn run() {
             importer::get_columns,
             importer::merge_files,
             importer::translate_file,
+            importer::append_files,
+            importer::diff_files,
+            importer::dedupe_files,
+            importer::transform_files,
+            importer::import_clipboard,
+            importer::push_history,
+            importer::list_history,
+            importer::clear_history,
             importer::get_config,
             importer::save_config,
             importer::set_window_theme,

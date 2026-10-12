@@ -29,6 +29,31 @@ const router = createRouter({
       component: () => import("@views/files/TranslateFiles.vue"),
     },
     {
+      path: "/files/combine",
+      name: "files-combine",
+      component: () => import("@views/files/CombineFiles.vue"),
+    },
+    {
+      path: "/files/diff",
+      name: "files-diff",
+      component: () => import("@views/files/DiffFiles.vue"),
+    },
+    {
+      path: "/files/dedupe",
+      name: "files-dedupe",
+      component: () => import("@views/files/DedupeFiles.vue"),
+    },
+    {
+      path: "/files/transform",
+      name: "files-transform",
+      component: () => import("@views/files/TransformFiles.vue"),
+    },
+    {
+      path: "/files/history",
+      name: "files-history",
+      component: () => import("@views/files/HistoryFiles.vue"),
+    },
+    {
       path: "/files/quality",
       name: "files-quality",
       component: () => import("@views/files/QualityCheck.vue"),

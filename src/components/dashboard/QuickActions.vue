@@ -5,12 +5,17 @@ import { useRouter } from "vue-router";
 import { useMessage } from "naive-ui";
 import {
   ArchiveOutline,
+  ColorWandOutline,
   CreateOutline,
   EyeOutline,
+  GitCompareOutline,
   GitMergeOutline,
   LanguageOutline,
+  LayersOutline,
+  RemoveCircleOutline,
   SettingsOutline,
   ShieldCheckmarkOutline,
+  TimeOutline,
 } from "@vicons/ionicons5";
 import { saveSettings, useSettings } from "@/composables/useSettings";
 
@@ -46,6 +51,34 @@ const allActions: ActionItem[] = [
     to: "/files/translate",
   },
   {
+    key: "append",
+    title: "文件合并",
+    desc: "多文件按行堆叠",
+    icon: LayersOutline,
+    to: "/files/combine",
+  },
+  {
+    key: "diff",
+    title: "数据对账",
+    desc: "按主键比对找差异",
+    icon: GitCompareOutline,
+    to: "/files/diff",
+  },
+  {
+    key: "dedupe",
+    title: "数据去重",
+    desc: "按字段保留首条",
+    icon: RemoveCircleOutline,
+    to: "/files/dedupe",
+  },
+  {
+    key: "transform",
+    title: "列规则变换",
+    desc: "替换拼接拆分",
+    icon: ColorWandOutline,
+    to: "/files/transform",
+  },
+  {
     key: "quality",
     title: "质量检测",
     desc: "检查文件质量",
@@ -58,6 +91,13 @@ const allActions: ActionItem[] = [
     desc: "管理本地缓存",
     icon: ArchiveOutline,
     to: "/files/cache",
+  },
+  {
+    key: "history",
+    title: "最近任务",
+    desc: "操作记录",
+    icon: TimeOutline,
+    to: "/files/history",
   },
   {
     key: "settings",

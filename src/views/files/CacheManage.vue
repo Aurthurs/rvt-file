@@ -1,17 +1,20 @@
 <script setup lang="ts">
-import { h, onMounted, ref } from "vue";
+import { computed, h, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { NButton, NDropdown, NPopconfirm, NTag, useMessage } from "naive-ui";
 import { RefreshOutline } from "@vicons/ionicons5";
 import BackBar from "@components/common/BackBar.vue";
 import { useSettings } from "@/composables/useSettings";
+import { actionLabels } from "@/composables/useHistory";
 
 interface CacheEntry {
   name: string;
   kind: "file" | "dir";
   size: number;
   modified: number;
+  /** 产生来源动作；非 parquet 为空串 */
+  origin: string;
 }
 
 const message = useMessage();
@@ -37,6 +40,31 @@ const checkedKeys = ref<string[]>([]);
 /** 导出进行中（大文件导出时显示遮罩防止误操作） */
 const exporting = ref(false);
 
+/** 来源筛选：空 = 全部 */
+const originFilter = ref("");
+
+/** 筛选选项：全部 + 列表中实际出现的来源 */
+const originOptions = computed(() => {
+  const seen = new Set(
+    entries.value.filter((e) => e.origin).map((e) => e.origin)
+  );
+  return [
+    { label: "全部来源", value: "" },
+    ...[...seen].map((o) => ({ label: actionLabels[o] || o, value: o })),
+  ];
+});
+
+const filteredEntries = computed(() =>
+  originFilter.value
+    ? entries.value.filter((e) => e.origin === originFilter.value)
+    : entries.value
+);
+
+// 切换筛选后清空勾选，避免批量操作作用于被筛掉的行
+watch(originFilter, () => {
+  checkedKeys.value = [];
+});
+
 const columns = [
   { type: "selection" as const },
   { title: "名称", key: "name", ellipsis: { tooltip: true } },
@@ -48,6 +76,19 @@ const columns = [
       row.kind === "dir"
         ? h(NTag, { type: "success", size: "small" }, { default: () => "文件夹" })
         : h(NTag, { type: "info", size: "small" }, { default: () => "文件" }),
+  },
+  {
+    title: "来源",
+    key: "origin",
+    width: 100,
+    render: (row: CacheEntry) =>
+      row.origin
+        ? h(
+            NTag,
+            { size: "small", bordered: false },
+            { default: () => actionLabels[row.origin] || row.origin }
+          )
+        : "-",
   },
   {
     title: "大小",
@@ -293,13 +334,19 @@ onMounted(refresh);
           </template>
           确认清空 data 目录下的所有缓存文件？此操作不可恢复。
         </n-popconfirm>
+        <n-select
+          v-model:value="originFilter"
+          class="origin-filter"
+          :options="originOptions"
+          placeholder="全部来源"
+        />
         <span class="path">{{ dataPath }}</span>
       </div>
 
       <n-data-table
         bordered
         :columns="columns"
-        :data="entries"
+        :data="filteredEntries"
         :row-key="(row: CacheEntry) => row.name"
         v-model:checked-row-keys="checkedKeys"
         :pagination="{ pageSize: settings.page_size }"
@@ -354,6 +401,10 @@ onMounted(refresh);
   align-items: center;
   gap: 12px;
   margin-bottom: 16px;
+}
+
+.origin-filter {
+  width: 140px;
 }
 
 .path {

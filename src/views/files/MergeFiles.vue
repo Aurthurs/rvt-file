@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
 import { useMessage } from "naive-ui";
 import BackBar from "@components/common/BackBar.vue";
+import { recordHistory } from "@/composables/useHistory";
 
 interface FileGroup {
   source: string;
@@ -33,7 +34,7 @@ const mainCols = ref<string[]>([]);
 const mainJoinFields = ref<string[]>([]);
 
 const secondaries = ref<SecondaryFile[]>([]);
-const outputName = ref("融合结果.parquet");
+const outputName = ref("融合结果");
 const joinType = ref("inner");
 
 const fileOptions = computed(() =>
@@ -180,6 +181,7 @@ async function onMerge() {
     );
     message.success(`融合完成，共 ${res.row_count} 行`);
     mergedResult.value = res;
+    recordHistory("merge", `融合 ${res.key}`, `/files/preview?key=${res.key}`);
   } catch (e) {
     message.error(String(e));
   } finally {

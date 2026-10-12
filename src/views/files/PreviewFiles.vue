@@ -4,10 +4,12 @@ import { useRoute } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { useMessage } from "naive-ui";
 import { FilterOutline } from "@vicons/ionicons5";
 import BackBar from "@components/common/BackBar.vue";
 import { useSettings } from "@/composables/useSettings";
+import { recordHistory } from "@/composables/useHistory";
 
 interface ImportedFile {
   key: string;
@@ -347,11 +349,53 @@ async function onExport(format: string) {
         ? `已按筛选条件导出到 ${dir}`
         : `已导出到 ${dir}`
     );
+    recordHistory(
+      "export",
+      `导出 ${currentKey.value}`,
+      `/files/preview?key=${currentKey.value}`
+    );
   } catch (e) {
     message.error(String(e));
   } finally {
     exporting.value = false;
   }
+}
+
+/** 导入结果并入列表并选中最后一个（上传与粘贴共用），逐文件记录历史 */
+function applyImportResults(results: ImportedFile[]) {
+  for (const res of results) {
+    let g = groups.value.find((x) => x.source === res.source);
+    if (!g) {
+      g = { source: res.source, sheets: [] };
+      groups.value.push(g);
+    }
+    const idx = g.sheets.findIndex((s) => s.key === res.key);
+    if (idx >= 0) g.sheets.splice(idx, 1);
+    g.sheets.push({ key: res.key, sheet: res.sheet });
+    recordHistory("import", `导入 ${res.source}`, `/files/preview?key=${res.key}`);
+  }
+  const last = results[results.length - 1];
+  if (last) {
+    selectedSource.value = last.source;
+    selectedSheet.value = last.sheet || "";
+  }
+}
+
+/** 导入失败统一处理：区分主动取消与报错 */
+function handleImportError(e: unknown) {
+  if (cancelling.value) {
+    message.info("导入已取消");
+  } else {
+    setError(e);
+    message.error(String(e));
+  }
+}
+
+function endImport() {
+  loading.value = false;
+  importing.value = false;
+  cancelling.value = false;
+  importProgress.value = null;
 }
 
 async function onUpload() {
@@ -370,35 +414,49 @@ async function onUpload() {
       const results = await invoke<ImportedFile[]>("import_file", {
         req: { path: p, batch_rows: settings.value.batch_rows },
       });
-      for (const res of results) {
-        let g = groups.value.find((x) => x.source === res.source);
-        if (!g) {
-          g = { source: res.source, sheets: [] };
-          groups.value.push(g);
-        }
-        const idx = g.sheets.findIndex((s) => s.key === res.key);
-        if (idx >= 0) g.sheets.splice(idx, 1);
-        g.sheets.push({ key: res.key, sheet: res.sheet });
-      }
-      const last = results[results.length - 1];
-      selectedSource.value = last.source;
-      selectedSheet.value = last.sheet || "";
+      applyImportResults(results);
     }
     clearFilter();
     page.value = 1;
     await loadPage();
   } catch (e) {
-    if (cancelling.value) {
-      message.info("导入已取消");
-    } else {
-      setError(e);
-      message.error(String(e));
-    }
+    handleImportError(e);
   } finally {
-    loading.value = false;
-    importing.value = false;
-    cancelling.value = false;
-    importProgress.value = null;
+    endImport();
+  }
+}
+
+/** 从剪贴板粘贴表格文本（Excel 复制的 TSV / CSV）直接导入 */
+async function onPasteImport() {
+  let text = "";
+  try {
+    text = await readText();
+  } catch {
+    message.error("读取剪贴板失败");
+    return;
+  }
+  if (!text.trim()) {
+    message.info("剪贴板没有文本内容");
+    return;
+  }
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const name = `剪贴板_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  importing.value = true;
+  errorMsg.value = "";
+  importProgress.value = null;
+  try {
+    const results = await invoke<ImportedFile[]>("import_clipboard", {
+      req: { text, name, batch_rows: settings.value.batch_rows },
+    });
+    applyImportResults(results);
+    clearFilter();
+    page.value = 1;
+    await loadPage();
+  } catch (e) {
+    handleImportError(e);
+  } finally {
+    endImport();
   }
 }
 </script>
@@ -413,6 +471,9 @@ async function onUpload() {
       <div class="toolbar">
         <n-button type="primary" @click="onUpload">
           上传文件
+        </n-button>
+        <n-button @click="onPasteImport" title="导入剪贴板中的表格文本">
+          粘贴导入
         </n-button>
         <n-select
           v-model:value="selectedSource"

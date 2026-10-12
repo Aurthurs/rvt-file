@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useMessage } from "naive-ui";
 import BackBar from "@components/common/BackBar.vue";
+import { recordHistory } from "@/composables/useHistory";
 
 interface FileGroup {
   source: string;
@@ -82,7 +83,7 @@ const targetSheet = ref("");
 const targetKey = ref("");
 const targetCols = ref<string[]>([]);
 
-const outputName = ref("翻译结果.parquet");
+const outputName = ref("翻译结果");
 
 const translating = ref(false);
 const cancelling = ref(false);
@@ -267,6 +268,7 @@ async function onStart() {
     result.value = res;
     doneKey.value = res.key;
     showDone.value = true;
+    recordHistory("translate", `翻译 ${res.key}`, `/files/preview?key=${res.key}`);
   } catch (e) {
     if (cancelling.value) {
       message.info("翻译已取消");
@@ -402,7 +404,7 @@ async function onStart() {
         <n-input
           v-model:value="outputName"
           class="name-input"
-          placeholder="翻译结果.parquet"
+          placeholder="输出文件名"
         />
         <n-button
           type="primary"

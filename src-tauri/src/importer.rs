@@ -217,7 +217,18 @@ fn import_csv(
     source_name: &str,
     batch_rows: usize,
 ) -> Result<Vec<ImportResult>, String> {
-    let mut reader = csv::Reader::from_path(src).map_err(|e| format!("读取 CSV 失败: {e}"))?;
+    let reader = csv::Reader::from_path(src).map_err(|e| format!("读取 CSV 失败: {e}"))?;
+    import_from_reader(app, reader, stem, source_name, batch_rows)
+}
+
+/// 从 csv Reader 解析并落盘（文件与剪贴板文本共用）
+fn import_from_reader(
+    app: Option<&tauri::AppHandle>,
+    mut reader: csv::Reader<impl std::io::Read>,
+    stem: &str,
+    source_name: &str,
+    batch_rows: usize,
+) -> Result<Vec<ImportResult>, String> {
     let header_row = reader
         .headers()
         .map_err(|e| format!("读取表头失败: {e}"))?
@@ -716,6 +727,8 @@ pub struct CacheEntry {
     pub kind: String, // "file" | "dir"
     pub size: u64,
     pub modified: i64,
+    /// 产生来源：import|merge|translate|append|diff|dedupe|aggregate|transform|processed|other；非 parquet 为空
+    pub origin: String,
 }
 
 #[derive(serde::Serialize)]
@@ -727,13 +740,29 @@ pub struct CacheInfo {
 /// 列出 data/ 目录下的文件和文件夹
 #[tauri::command]
 pub fn list_cache() -> Result<CacheInfo, String> {
+    // 产生类操作（history.action），export 只读不算来源
+    const PRODUCE: &[&str] = &[
+        "import", "merge", "translate", "append", "diff", "dedupe", "aggregate", "transform",
+    ];
+    // key -> 产生动作：history 新在前取首个；旧文件退回 manifest 粗分（source != key 为导入）
+    let mut origins: HashMap<String, String> = HashMap::new();
+    for h in load_history() {
+        if !PRODUCE.contains(&h.action.as_str()) {
+            continue;
+        }
+        if let Some(k) = h.detail.split("key=").nth(1) {
+            origins.entry(k.to_string()).or_insert(h.action);
+        }
+    }
+    let manifest = load_manifest().unwrap_or_default();
+
     let dir = data_dir()?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| format!("读取目录失败: {e}"))? {
         let entry = entry.map_err(|e| format!("读取目录项失败: {e}"))?;
         let name = entry.file_name().to_string_lossy().to_string();
-        // manifest.json 是内部清单，不展示
-        if name == "manifest.json" {
+        // manifest.json / history.json 是内部数据，不展示
+        if name == "manifest.json" || name == "history.json" {
             continue;
         }
         let md = entry.metadata().map_err(|e| format!("读取元数据失败: {e}"))?;
@@ -743,11 +772,26 @@ pub fn list_cache() -> Result<CacheInfo, String> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let is_parquet = name.ends_with(".parquet") && !md.is_dir();
+        let origin = if !is_parquet {
+            String::new()
+        } else if let Some(a) = origins.get(&name) {
+            a.clone()
+        } else if let Some((src, _)) = manifest.get(&name) {
+            if src != &name {
+                "import".to_string()
+            } else {
+                "processed".to_string()
+            }
+        } else {
+            "other".to_string()
+        };
         entries.push(CacheEntry {
             name,
             kind: if md.is_dir() { "dir".to_string() } else { "file".to_string() },
             size: md.len(),
             modified,
+            origin,
         });
     }
     Ok(CacheInfo {
@@ -1755,6 +1799,976 @@ fn do_translate(app: &tauri::AppHandle, req: TranslateRequest) -> Result<Transla
     })
 }
 
+/// 输出文件名规范化：trim、缺省名、自动补 .parquet
+fn normalized_out(raw: &str, default: &str) -> String {
+    let n = raw.trim();
+    let base = if n.is_empty() { default } else { n };
+    if base.ends_with(".parquet") {
+        base.to_string()
+    } else {
+        format!("{base}.parquet")
+    }
+}
+
+/// 从候选名起生成不与 used 冲突的列名
+fn unique_out_name(used: &mut HashSet<String>, base: &str) -> String {
+    let mut name = base.to_string();
+    let mut n = 1;
+    while used.contains(&name) {
+        n += 1;
+        name = format!("{base}_{n}");
+    }
+    used.insert(name.clone());
+    name
+}
+
+/// 把源行按目标列序投影（源文件缺失的列为 null）
+fn project_row(row: &[Value], src_cols: &[String], union: &[String]) -> Vec<Value> {
+    union
+        .iter()
+        .map(|u| {
+            src_cols
+                .iter()
+                .position(|c| c == u)
+                .and_then(|i| row.get(i).cloned())
+                .unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
+/// 纵向合并请求：同结构多表按列并集堆叠
+#[derive(serde::Deserialize)]
+pub struct AppendRequest {
+    /// 参与合并的文件 key（按选择顺序，决定列顺序与行序）
+    pub keys: Vec<String>,
+    /// 输出字段（按选择顺序）；空 = 所有文件的列并集
+    #[serde(default)]
+    pub fields: Vec<String>,
+    /// 输出文件名
+    pub output_name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct AppendResult {
+    pub key: String,
+    pub total: usize,
+    pub files: usize,
+}
+
+/// 纵向合并：列取所有文件的并集（缺失列补 null），流式逐文件追加写新 parquet。
+#[tauri::command]
+pub async fn append_files(
+    app: tauri::AppHandle,
+    req: AppendRequest,
+) -> Result<AppendResult, String> {
+    IMPORT_CANCEL.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || do_append(Some(&app), req))
+        .await
+        .map_err(|e| format!("合并任务异常: {e}"))?
+}
+
+fn do_append(
+    app: Option<&tauri::AppHandle>,
+    req: AppendRequest,
+) -> Result<AppendResult, String> {
+    if req.keys.len() < 2 {
+        return Err("请至少选择两个文件".to_string());
+    }
+    let files = req.keys.len();
+    // 1. 扫描各文件 schema 求列并集（保序）+ 预期总行数
+    let mut union: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut total = 0usize;
+    for k in &req.keys {
+        let path = data_dir()?.join(k);
+        let file = File::open(&path).map_err(|e| format!("打开 {k} 失败: {e}"))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| format!("读取 {k} 失败: {e}"))?;
+        total += builder.metadata().file_metadata().num_rows().max(0) as usize;
+        for f in builder.schema().fields() {
+            let name = f.name().to_string();
+            if seen.insert(name.clone()) {
+                union.push(name);
+            }
+        }
+    }
+
+    // 输出列：用户选了字段则按选择顺序输出（须存在于至少一个文件），否则全并集
+    let out_cols: Vec<String> = if req.fields.is_empty() {
+        union
+    } else {
+        let mut dedup: Vec<String> = Vec::with_capacity(req.fields.len());
+        for f in &req.fields {
+            if !seen.contains(f) {
+                return Err(format!("字段 {f} 不在所选文件中"));
+            }
+            if !dedup.contains(f) {
+                dedup.push(f.clone());
+            }
+        }
+        dedup
+    };
+
+    let out_name = normalized_out(&req.output_name, "合并结果");
+    let out_path = data_dir()?.join(&out_name);
+    let schema = Arc::new(Schema::new(
+        out_cols
+            .iter()
+            .map(|c| Field::new(c.clone(), ArrowDataType::Utf8, true))
+            .collect::<Vec<Field>>(),
+    ));
+    let out_file = File::create(&out_path).map_err(|e| format!("无法创建文件: {e}"))?;
+    let mut writer = ArrowWriter::try_new(out_file, schema.clone(), None)
+        .map_err(|e| format!("创建写入器失败: {e}"))?;
+
+    let outcome = (move || -> Result<usize, String> {
+        const BATCH: usize = 8192;
+        let mut builders: Vec<StringBuilder> =
+            out_cols.iter().map(|_| StringBuilder::new()).collect();
+        let mut buffered = 0usize;
+        let mut processed = 0usize;
+        for (fi, k) in req.keys.iter().enumerate() {
+            if IMPORT_CANCEL.load(Ordering::Relaxed) {
+                return Err("合并已取消".to_string());
+            }
+            let path = data_dir()?.join(k);
+            let file = File::open(&path).map_err(|e| format!("打开 {k} 失败: {e}"))?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| format!("读取 {k} 失败: {e}"))?;
+            let src_cols: Vec<String> = builder
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect();
+            // 目标列 -> 源列索引（该文件缺失的列写 null）
+            let mapping: Vec<Option<usize>> = out_cols
+                .iter()
+                .map(|u| src_cols.iter().position(|c| c == u))
+                .collect();
+            let reader = builder.build().map_err(|e| format!("解析 {k} 失败: {e}"))?;
+            for batch in reader {
+                if IMPORT_CANCEL.load(Ordering::Relaxed) {
+                    return Err("合并已取消".to_string());
+                }
+                let batch = batch.map_err(|e| format!("读取数据失败: {e}"))?;
+                for i in 0..batch.num_rows() {
+                    for (ui, src) in mapping.iter().enumerate() {
+                        match *src {
+                            Some(si) => match array_value(batch.column(si), i) {
+                                Value::Null => builders[ui].append_null(),
+                                Value::String(s) => builders[ui].append_value(s),
+                                _ => builders[ui].append_null(),
+                            },
+                            None => builders[ui].append_null(),
+                        }
+                    }
+                    processed += 1;
+                    buffered += 1;
+                    if buffered >= BATCH {
+                        flush_batch(&mut writer, &schema, &mut builders)?;
+                        buffered = 0;
+                    }
+                }
+                if let Some(a) = app {
+                    emit_progress(
+                        a,
+                        &ImportProgress {
+                            source: k.clone(),
+                            sheet: String::new(),
+                            stage: "write".to_string(),
+                            processed,
+                            total,
+                            sheet_index: fi + 1,
+                            sheet_count: files,
+                        },
+                    );
+                }
+            }
+        }
+        flush_batch(&mut writer, &schema, &mut builders)?;
+        writer
+            .close()
+            .map_err(|e| format!("保存失败: {e}"))?;
+        Ok(processed)
+    })();
+
+    match outcome {
+        Ok(n) => {
+            let _ = update_manifest(&out_name, &out_name, "");
+            Ok(AppendResult {
+                key: out_name,
+                total: n,
+                files,
+            })
+        }
+        Err(e) => {
+            // writer 已随闭包退出 drop，删除半成品
+            let _ = std::fs::remove_file(&out_path);
+            Err(e)
+        }
+    }
+}
+
+/// 去重请求：按字段组合保留首条，结果生成新文件
+#[derive(serde::Deserialize)]
+pub struct DedupeRequest {
+    pub key: String,
+    /// 去重依据列；空 = 整行去重
+    pub fields: Vec<String>,
+    pub output_name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct DedupeResult {
+    pub key: String,
+    pub total: usize,
+    pub kept: usize,
+}
+
+/// 数据去重：流式判重保留首条，写新 parquet（原文件不动）。
+#[tauri::command]
+pub async fn dedupe_files(
+    app: tauri::AppHandle,
+    req: DedupeRequest,
+) -> Result<DedupeResult, String> {
+    IMPORT_CANCEL.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || do_dedupe(Some(&app), req))
+        .await
+        .map_err(|e| format!("去重任务异常: {e}"))?
+}
+
+fn do_dedupe(
+    app: Option<&tauri::AppHandle>,
+    req: DedupeRequest,
+) -> Result<DedupeResult, String> {
+    let path = data_dir()?.join(&req.key);
+    let file = File::open(&path).map_err(|e| format!("无法打开文件: {e}"))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| format!("读取失败: {e}"))?;
+    let total = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    let columns: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    // 依据列索引；空 = 全列
+    let key_idx: Vec<usize> = if req.fields.is_empty() {
+        (0..columns.len()).collect()
+    } else {
+        req.fields
+            .iter()
+            .map(|f| {
+                columns
+                    .iter()
+                    .position(|c| c == f)
+                    .ok_or_else(|| format!("文件缺少字段: {f}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let reader = builder.build().map_err(|e| format!("解析失败: {e}"))?;
+    let num_cols = columns.len();
+
+    let out_name = normalized_out(&req.output_name, "去重结果");
+    let out_path = data_dir()?.join(&out_name);
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|c| Field::new(c.clone(), ArrowDataType::Utf8, true))
+            .collect::<Vec<Field>>(),
+    ));
+    let out_file = File::create(&out_path).map_err(|e| format!("无法创建文件: {e}"))?;
+    let mut writer = ArrowWriter::try_new(out_file, schema.clone(), None)
+        .map_err(|e| format!("创建写入器失败: {e}"))?;
+
+    let outcome = (move || -> Result<usize, String> {
+        const BATCH: usize = 8192;
+        let mut builders: Vec<StringBuilder> =
+            columns.iter().map(|_| StringBuilder::new()).collect();
+        let mut buffered = 0usize;
+        let mut processed = 0usize;
+        let mut kept = 0usize;
+        let mut seen: HashSet<String> = HashSet::new();
+        for batch in reader {
+            if IMPORT_CANCEL.load(Ordering::Relaxed) {
+                return Err("去重已取消".to_string());
+            }
+            let batch = batch.map_err(|e| format!("读取数据失败: {e}"))?;
+            for i in 0..batch.num_rows() {
+                let row: Vec<Value> = (0..num_cols)
+                    .map(|c| array_value(batch.column(c), i))
+                    .collect();
+                processed += 1;
+                if !seen.insert(join_key(&row, &key_idx)) {
+                    continue; // 重复行跳过
+                }
+                kept += 1;
+                for (c, v) in row.iter().enumerate() {
+                    match v {
+                        Value::Null => builders[c].append_null(),
+                        Value::String(s) => builders[c].append_value(s),
+                        _ => builders[c].append_null(),
+                    }
+                }
+                buffered += 1;
+                if buffered >= BATCH {
+                    flush_batch(&mut writer, &schema, &mut builders)?;
+                    buffered = 0;
+                }
+            }
+            if let Some(a) = app {
+                emit_progress(
+                    a,
+                    &ImportProgress {
+                        source: req.key.clone(),
+                        sheet: String::new(),
+                        stage: "write".to_string(),
+                        processed,
+                        total,
+                        sheet_index: 1,
+                        sheet_count: 1,
+                    },
+                );
+            }
+        }
+        flush_batch(&mut writer, &schema, &mut builders)?;
+        writer
+            .close()
+            .map_err(|e| format!("保存失败: {e}"))?;
+        Ok(kept)
+    })();
+
+    match outcome {
+        Ok(kept) => {
+            let _ = update_manifest(&out_name, &out_name, "");
+            Ok(DedupeResult {
+                key: out_name,
+                total,
+                kept,
+            })
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            Err(e)
+        }
+    }
+}
+
+/// 对账请求：两文件按主键对比，差异行输出（相同行不输出）
+#[derive(serde::Deserialize)]
+pub struct DiffRequest {
+    pub left_key: String,
+    /// 左表主键列
+    pub left_fields: Vec<String>,
+    pub right_key: String,
+    /// 右表主键列（数量与左一致，按顺序配对）
+    pub right_fields: Vec<String>,
+    pub output_name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct DiffResult {
+    pub key: String,
+    pub only_left: usize,
+    pub only_right: usize,
+    pub changed: usize,
+    pub same: usize,
+}
+
+/// 数据对账：按主键比对两文件，输出「仅左表 / 仅右表 / 有差异」行，
+/// 附 对比结果、差异字段 两列；相同行只计数不输出。
+#[tauri::command]
+pub async fn diff_files(app: tauri::AppHandle, req: DiffRequest) -> Result<DiffResult, String> {
+    IMPORT_CANCEL.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || do_diff(Some(&app), req))
+        .await
+        .map_err(|e| format!("对账任务异常: {e}"))?
+}
+
+fn do_diff(app: Option<&tauri::AppHandle>, req: DiffRequest) -> Result<DiffResult, String> {
+    if req.left_fields.is_empty() || req.right_fields.is_empty() {
+        return Err("请选择左右主键字段".to_string());
+    }
+    if req.left_fields.len() != req.right_fields.len() {
+        return Err("左右主键字段数量需一致".to_string());
+    }
+    if let Some(a) = app {
+        emit_progress(
+            a,
+            &ImportProgress {
+                source: req.left_key.clone(),
+                sheet: String::new(),
+                stage: "read".to_string(),
+                processed: 0,
+                total: 0,
+                sheet_index: 1,
+                sheet_count: 2,
+            },
+        );
+    }
+    let (lcols, lrows) = read_table_full(&req.left_key)?;
+    if IMPORT_CANCEL.load(Ordering::Relaxed) {
+        return Err("对账已取消".to_string());
+    }
+    if let Some(a) = app {
+        emit_progress(
+            a,
+            &ImportProgress {
+                source: req.right_key.clone(),
+                sheet: String::new(),
+                stage: "read".to_string(),
+                processed: 0,
+                total: 0,
+                sheet_index: 2,
+                sheet_count: 2,
+            },
+        );
+    }
+    let (rcols, rrows) = read_table_full(&req.right_key)?;
+
+    let l_idx: Vec<usize> = req
+        .left_fields
+        .iter()
+        .map(|f| {
+            lcols
+                .iter()
+                .position(|c| c == f)
+                .ok_or_else(|| format!("左表缺少主键字段: {f}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let r_idx: Vec<usize> = req
+        .right_fields
+        .iter()
+        .map(|f| {
+            rcols
+                .iter()
+                .position(|c| c == f)
+                .ok_or_else(|| format!("右表缺少主键字段: {f}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // 列并集（左先右后）
+    let mut union: Vec<String> = Vec::new();
+    let mut used: HashSet<String> = HashSet::new();
+    for c in lcols.iter().chain(rcols.iter()) {
+        if used.insert(c.clone()) {
+            union.push(c.clone());
+        }
+    }
+    // 键列不参与差异比较
+    let key_names: HashSet<String> = req
+        .left_fields
+        .iter()
+        .chain(req.right_fields.iter())
+        .cloned()
+        .collect();
+
+    // 右表建键索引（重复键保留首行），记录命中标记
+    let mut r_map: HashMap<String, usize> = HashMap::with_capacity(rrows.len());
+    for (i, row) in rrows.iter().enumerate() {
+        r_map.entry(join_key(row, &r_idx)).or_insert(i);
+    }
+    let mut r_hit = vec![false; rrows.len()];
+
+    let status_col = unique_out_name(&mut used, "对比结果");
+    let fields_col = unique_out_name(&mut used, "差异字段");
+    let mut out_cols = union.clone();
+    out_cols.push(status_col);
+    out_cols.push(fields_col);
+
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    let mut only_left = 0usize;
+    let mut changed = 0usize;
+    let mut same = 0usize;
+    let total_left = lrows.len();
+
+    for (li, lrow) in lrows.iter().enumerate() {
+        if li % 10000 == 0 {
+            if IMPORT_CANCEL.load(Ordering::Relaxed) {
+                return Err("对账已取消".to_string());
+            }
+            if let Some(a) = app {
+                emit_progress(
+                    a,
+                    &ImportProgress {
+                        source: req.left_key.clone(),
+                        sheet: String::new(),
+                        stage: "write".to_string(),
+                        processed: li,
+                        total: total_left,
+                        sheet_index: 1,
+                        sheet_count: 1,
+                    },
+                );
+            }
+        }
+        let key = join_key(lrow, &l_idx);
+        match r_map.get(&key) {
+            None => {
+                only_left += 1;
+                let mut out = project_row(lrow, &lcols, &union);
+                out.push(Value::String("仅左表".to_string()));
+                out.push(Value::String(String::new()));
+                out_rows.push(out);
+            }
+            Some(&ri) => {
+                r_hit[ri] = true;
+                let lp = project_row(lrow, &lcols, &union);
+                let rp = project_row(&rrows[ri], &rcols, &union);
+                let mut diffs: Vec<String> = Vec::new();
+                for (ui, u) in union.iter().enumerate() {
+                    if key_names.contains(u) {
+                        continue;
+                    }
+                    if value_to_string(&lp[ui]) != value_to_string(&rp[ui]) {
+                        diffs.push(u.clone());
+                    }
+                }
+                if diffs.is_empty() {
+                    same += 1;
+                } else {
+                    changed += 1;
+                    let mut out = lp;
+                    out.push(Value::String("有差异".to_string()));
+                    out.push(Value::String(diffs.join(",")));
+                    out_rows.push(out);
+                }
+            }
+        }
+    }
+
+    let mut only_right = 0usize;
+    for (ri, row) in rrows.iter().enumerate() {
+        if r_hit[ri] {
+            continue;
+        }
+        only_right += 1;
+        let mut out = project_row(row, &rcols, &union);
+        out.push(Value::String("仅右表".to_string()));
+        out.push(Value::String(String::new()));
+        out_rows.push(out);
+    }
+
+    if IMPORT_CANCEL.load(Ordering::Relaxed) {
+        return Err("对账已取消".to_string());
+    }
+    if let Some(a) = app {
+        emit_progress(
+            a,
+            &ImportProgress {
+                source: req.left_key.clone(),
+                sheet: String::new(),
+                stage: "write".to_string(),
+                processed: total_left,
+                total: total_left,
+                sheet_index: 1,
+                sheet_count: 1,
+            },
+        );
+    }
+    let out_name = normalized_out(&req.output_name, "对账结果");
+    write_values_parquet(&out_name, &out_cols, &out_rows)?;
+    let _ = update_manifest(&out_name, &out_name, "");
+
+    Ok(DiffResult {
+        key: out_name,
+        only_left,
+        only_right,
+        changed,
+        same,
+    })
+}
+
+/// 单条变换规则：对目标列按规则改写
+#[derive(serde::Deserialize)]
+pub struct TransformOp {
+    /// 目标列
+    pub field: String,
+    /// trim | upper | lower | replace | concat | split
+    pub op: String,
+    /// replace: 旧值,新值 ；concat: 拼接列,分隔符 ；split: 分隔符,新列名
+    pub param: String,
+}
+
+/// 列规则变换请求：按顺序对每行应用规则，结果生成新文件
+#[derive(serde::Deserialize)]
+pub struct TransformRequest {
+    pub key: String,
+    pub ops: Vec<TransformOp>,
+    pub output_name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct TransformResult {
+    pub key: String,
+    pub rows: usize,
+}
+
+/// 预解析的变换计划
+enum OpKind {
+    Trim,
+    Upper,
+    Lower,
+    Replace { from: String, to: String },
+    Concat { aux: usize, sep: String },
+    Split { sep: String, new_col: usize },
+}
+
+struct OpPlan {
+    kind: OpKind,
+    target: usize,
+}
+
+/// 列规则变换：流式逐行应用规则（trim/大小写/替换/拼接/拆分），写新 parquet。
+#[tauri::command]
+pub async fn transform_files(
+    app: tauri::AppHandle,
+    req: TransformRequest,
+) -> Result<TransformResult, String> {
+    IMPORT_CANCEL.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || do_transform(Some(&app), req))
+        .await
+        .map_err(|e| format!("变换任务异常: {e}"))?
+}
+
+fn do_transform(
+    app: Option<&tauri::AppHandle>,
+    req: TransformRequest,
+) -> Result<TransformResult, String> {
+    if req.ops.is_empty() {
+        return Err("请至少添加一条变换规则".to_string());
+    }
+    let path = data_dir()?.join(&req.key);
+    let file = File::open(&path).map_err(|e| format!("无法打开文件: {e}"))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| format!("读取失败: {e}"))?;
+    let total = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    let columns: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+
+    // 校验参数 + 预扫描 split 新列，确定最终列集
+    let mut final_cols = columns.clone();
+    let mut plans: Vec<OpPlan> = Vec::with_capacity(req.ops.len());
+    for (oi, op) in req.ops.iter().enumerate() {
+        let target = columns
+            .iter()
+            .position(|c| c == &op.field)
+            .ok_or_else(|| format!("文件缺少字段: {}", op.field))?;
+        let kind = match op.op.as_str() {
+            "trim" => OpKind::Trim,
+            "upper" => OpKind::Upper,
+            "lower" => OpKind::Lower,
+            "replace" => {
+                let (from, to) = op
+                    .param
+                    .split_once(',')
+                    .ok_or_else(|| format!("第 {} 条规则参数格式：旧值,新值", oi + 1))?;
+                if from.is_empty() {
+                    return Err(format!("第 {} 条规则：替换的旧值不能为空", oi + 1));
+                }
+                OpKind::Replace {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                }
+            }
+            "concat" => {
+                let (col, sep) = op
+                    .param
+                    .split_once(',')
+                    .ok_or_else(|| format!("第 {} 条规则参数格式：拼接列,分隔符", oi + 1))?;
+                let aux = columns
+                    .iter()
+                    .position(|c| c == col)
+                    .ok_or_else(|| format!("文件缺少拼接字段: {col}"))?;
+                OpKind::Concat {
+                    aux,
+                    sep: sep.to_string(),
+                }
+            }
+            "split" => {
+                let (sep, new_col) = op
+                    .param
+                    .split_once(',')
+                    .ok_or_else(|| format!("第 {} 条规则参数格式：分隔符,新列名", oi + 1))?;
+                if sep.is_empty() {
+                    return Err(format!("第 {} 条规则：分隔符不能为空", oi + 1));
+                }
+                if new_col.trim().is_empty() {
+                    return Err(format!("第 {} 条规则：新列名不能为空", oi + 1));
+                }
+                let idx = match final_cols.iter().position(|c| c == new_col) {
+                    Some(i) => i,
+                    None => {
+                        final_cols.push(new_col.to_string());
+                        final_cols.len() - 1
+                    }
+                };
+                OpKind::Split {
+                    sep: sep.to_string(),
+                    new_col: idx,
+                }
+            }
+            other => return Err(format!("不支持的变换操作: {other}")),
+        };
+        plans.push(OpPlan { kind, target });
+    }
+
+    let reader = builder.build().map_err(|e| format!("解析失败: {e}"))?;
+    let num_cols = columns.len();
+    let out_name = normalized_out(&req.output_name, "变换结果");
+    let out_path = data_dir()?.join(&out_name);
+    let schema = Arc::new(Schema::new(
+        final_cols
+            .iter()
+            .map(|c| Field::new(c.clone(), ArrowDataType::Utf8, true))
+            .collect::<Vec<Field>>(),
+    ));
+    let out_file = File::create(&out_path).map_err(|e| format!("无法创建文件: {e}"))?;
+    let mut writer = ArrowWriter::try_new(out_file, schema.clone(), None)
+        .map_err(|e| format!("创建写入器失败: {e}"))?;
+
+    let outcome = (move || -> Result<usize, String> {
+        const BATCH: usize = 8192;
+        let mut builders: Vec<StringBuilder> =
+            final_cols.iter().map(|_| StringBuilder::new()).collect();
+        let mut buffered = 0usize;
+        let mut processed = 0usize;
+        for batch in reader {
+            if IMPORT_CANCEL.load(Ordering::Relaxed) {
+                return Err("变换已取消".to_string());
+            }
+            let batch = batch.map_err(|e| format!("读取数据失败: {e}"))?;
+            for i in 0..batch.num_rows() {
+                // 原列进 row，split 新列初始 null
+                let mut row: Vec<Value> = (0..num_cols)
+                    .map(|c| array_value(batch.column(c), i))
+                    .collect();
+                row.resize(final_cols.len(), Value::Null);
+                for p in plans.iter() {
+                    match &p.kind {
+                        OpKind::Trim => {
+                            if let Value::String(s) = &mut row[p.target] {
+                                *s = s.trim().to_string();
+                            }
+                        }
+                        OpKind::Upper => {
+                            if let Value::String(s) = &mut row[p.target] {
+                                *s = s.to_uppercase();
+                            }
+                        }
+                        OpKind::Lower => {
+                            if let Value::String(s) = &mut row[p.target] {
+                                *s = s.to_lowercase();
+                            }
+                        }
+                        OpKind::Replace { from, to } => {
+                            if let Value::String(s) = &mut row[p.target] {
+                                *s = s.replace(from, to);
+                            }
+                        }
+                        OpKind::Concat { aux, sep } => {
+                            let mut a = value_to_string(&row[p.target]);
+                            let b = value_to_string(&row[*aux]);
+                            a.push_str(sep);
+                            a.push_str(&b);
+                            row[p.target] = Value::String(a);
+                        }
+                        OpKind::Split { sep, new_col } => {
+                            let s = value_to_string(&row[p.target]);
+                            if !s.is_empty() {
+                                let mut parts = s.splitn(2, sep.as_str());
+                                let head = parts.next().unwrap_or("").to_string();
+                                row[p.target] = Value::String(head);
+                                if let Some(tail) = parts.next() {
+                                    row[*new_col] = Value::String(tail.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                processed += 1;
+                for (c, v) in row.iter().enumerate() {
+                    match v {
+                        Value::Null => builders[c].append_null(),
+                        Value::String(s) => builders[c].append_value(s),
+                        _ => builders[c].append_null(),
+                    }
+                }
+                buffered += 1;
+                if buffered >= BATCH {
+                    flush_batch(&mut writer, &schema, &mut builders)?;
+                    buffered = 0;
+                }
+            }
+            if let Some(a) = app {
+                emit_progress(
+                    a,
+                    &ImportProgress {
+                        source: req.key.clone(),
+                        sheet: String::new(),
+                        stage: "write".to_string(),
+                        processed,
+                        total,
+                        sheet_index: 1,
+                        sheet_count: 1,
+                    },
+                );
+            }
+        }
+        flush_batch(&mut writer, &schema, &mut builders)?;
+        writer
+            .close()
+            .map_err(|e| format!("保存失败: {e}"))?;
+        Ok(processed)
+    })();
+
+    match outcome {
+        Ok(rows) => {
+            let _ = update_manifest(&out_name, &out_name, "");
+            Ok(TransformResult { key: out_name, rows })
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            Err(e)
+        }
+    }
+}
+
+/// 剪贴板导入请求：文本按分隔符解析为表格并落盘
+#[derive(serde::Deserialize)]
+pub struct ClipboardImportRequest {
+    pub text: String,
+    /// 输出文件名（不含扩展名）；空则按时间戳生成
+    pub name: Option<String>,
+    pub batch_rows: usize,
+}
+
+/// 剪贴板导入：探测 tab/逗号分隔，解析为 parquet 进入预览列表。
+#[tauri::command]
+pub async fn import_clipboard(
+    app: tauri::AppHandle,
+    req: ClipboardImportRequest,
+) -> Result<Vec<ImportResult>, String> {
+    let text = req.text;
+    let batch_rows = req.batch_rows.max(1);
+    let stem = match req.name {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("剪贴板_{ms}")
+        }
+    };
+    IMPORT_CANCEL.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || {
+        import_text(Some(&app), &text, &stem, batch_rows)
+    })
+    .await
+    .map_err(|e| format!("导入任务异常: {e}"))?
+}
+
+/// 按首行探测分隔符（tab 优先），去 BOM 后按 CSV 解析文本
+fn import_text(
+    app: Option<&tauri::AppHandle>,
+    text: &str,
+    stem: &str,
+    batch_rows: usize,
+) -> Result<Vec<ImportResult>, String> {
+    let text = text.trim_start_matches('\u{feff}');
+    if text.trim().is_empty() {
+        return Err("没有可导入的数据".to_string());
+    }
+    let first = text.lines().next().unwrap_or("");
+    let tabs = first.matches('\t').count();
+    let commas = first.matches(',').count();
+    let delim = if tabs > 0 && tabs >= commas { b'\t' } else { b',' };
+    let reader = csv::ReaderBuilder::new()
+        .delimiter(delim)
+        .from_reader(text.as_bytes());
+    let source_name = format!("{stem}.csv");
+    import_from_reader(app, reader, stem, &source_name, batch_rows)
+}
+
+/// 历史条目：记录最近的操作与跳转目标
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct HistoryEntry {
+    /// epoch 毫秒
+    pub time: u64,
+    /// 操作类型：import | export | merge | translate | append | diff | dedupe | aggregate | transform
+    pub action: String,
+    pub title: String,
+    /// 跳转路径（含 query），如 /files/preview?key=xxx
+    pub detail: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct HistoryPush {
+    pub action: String,
+    pub title: String,
+    pub detail: String,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn load_history() -> Vec<HistoryEntry> {
+    let Ok(dir) = data_dir() else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(dir.join("history.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_history(list: &[HistoryEntry]) -> Result<(), String> {
+    let s = serde_json::to_string(list).map_err(|e| e.to_string())?;
+    std::fs::write(data_dir()?.join("history.json"), s).map_err(|e| format!("保存历史失败: {e}"))
+}
+
+/// 记录一条操作历史（最新在前，最多保留 50 条）
+#[tauri::command]
+pub fn push_history(req: HistoryPush) -> Result<(), String> {
+    if req.title.trim().is_empty() {
+        return Ok(());
+    }
+    let mut list = load_history();
+    list.insert(
+        0,
+        HistoryEntry {
+            time: now_ms(),
+            action: req.action,
+            title: req.title,
+            detail: req.detail,
+        },
+    );
+    list.truncate(50);
+    save_history(&list)
+}
+
+/// 读取操作历史（解析失败返回空列表）
+#[tauri::command]
+pub fn list_history() -> Vec<HistoryEntry> {
+    load_history()
+}
+
+/// 清空操作历史
+#[tauri::command]
+pub fn clear_history() -> Result<(), String> {
+    save_history(&[])
+}
+
 /// 全局设置：主题 + 默认值，持久化到 app_config_dir/settings.json
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -2234,5 +3248,224 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(data_dir().unwrap().join("rvt_import_test.parquet"));
+    }
+
+    /// 纵向合并：列取并集，缺失列补 null，行按顺序堆叠
+    #[test]
+    fn append_stacks_column_union() {
+        let a = std::env::temp_dir().join("rvt_append_a.csv");
+        let mut f = File::create(&a).unwrap();
+        f.write_all(b"a,b\n1,2\n3,4\n").unwrap();
+        import_csv(None, &a, "rvt_append_a", "rvt_append_a.csv", 8192).unwrap();
+
+        let b = std::env::temp_dir().join("rvt_append_b.csv");
+        let mut f = File::create(&b).unwrap();
+        f.write_all(b"b,c\n9,8\n").unwrap();
+        import_csv(None, &b, "rvt_append_b", "rvt_append_b.csv", 8192).unwrap();
+
+        let res = do_append(
+            None,
+            AppendRequest {
+                keys: vec![
+                    "rvt_append_a.parquet".to_string(),
+                    "rvt_append_b.parquet".to_string(),
+                ],
+                fields: vec![],
+                output_name: "rvt_append_out.parquet".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(res.total, 3);
+        assert_eq!(res.files, 2);
+
+        let (cols, rows) = read_table_full("rvt_append_out.parquet").unwrap();
+        assert_eq!(cols, vec!["a", "b", "c"]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![json!("1"), json!("2"), Value::Null]);
+        assert_eq!(rows[1], vec![json!("3"), json!("4"), Value::Null]);
+        assert_eq!(rows[2], vec![Value::Null, json!("9"), json!("8")]);
+
+        // 可选字段：只输出 b 列（按选择顺序），其余丢弃
+        let res = do_append(
+            None,
+            AppendRequest {
+                keys: vec![
+                    "rvt_append_a.parquet".to_string(),
+                    "rvt_append_b.parquet".to_string(),
+                ],
+                fields: vec!["b".to_string()],
+                output_name: "rvt_append_fields.parquet".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(res.total, 3);
+        let (cols, rows) = read_table_full("rvt_append_fields.parquet").unwrap();
+        assert_eq!(cols, vec!["b"]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![json!("2")]);
+
+        let dd = data_dir().unwrap();
+        for k in [
+            "rvt_append_a",
+            "rvt_append_b",
+            "rvt_append_out",
+            "rvt_append_fields",
+        ] {
+            let _ = std::fs::remove_file(dd.join(format!("{k}.parquet")));
+        }
+    }
+
+
+    /// 去重：按字段保留首条，重复行不输出
+    #[test]
+    fn dedupe_keeps_first_row() {
+        let t = std::env::temp_dir().join("rvt_dedupe_in.csv");
+        let mut f = File::create(&t).unwrap();
+        f.write_all(b"name,age\nAlice,25\nBob,30\nAlice,99\nAnna,35\n").unwrap();
+        import_csv(None, &t, "rvt_dedupe_in", "rvt_dedupe_in.csv", 8192).unwrap();
+
+        let res = do_dedupe(
+            None,
+            DedupeRequest {
+                key: "rvt_dedupe_in.parquet".to_string(),
+                fields: vec!["name".to_string()],
+                output_name: "rvt_dedupe_out".to_string(), // 不带后缀，自动补
+            },
+        )
+        .unwrap();
+        assert_eq!(res.total, 4);
+        assert_eq!(res.kept, 3);
+
+        let (cols, rows) = read_table_full("rvt_dedupe_out.parquet").unwrap();
+        assert_eq!(cols, vec!["name", "age"]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![json!("Alice"), json!("25")]);
+        assert_eq!(rows[2], vec![json!("Anna"), json!("35")]);
+
+        let dd = data_dir().unwrap();
+        let _ = std::fs::remove_file(dd.join("rvt_dedupe_in.parquet"));
+        let _ = std::fs::remove_file(dd.join("rvt_dedupe_out.parquet"));
+    }
+
+    /// 对账：同键比较值，输出 仅左表/仅右表/有差异，相同只计数
+    #[test]
+    fn diff_reports_all_cases() {
+        let l = std::env::temp_dir().join("rvt_diff_l.csv");
+        let mut f = File::create(&l).unwrap();
+        f.write_all(b"id,name\nA,x\nB,y\nC,z\n").unwrap();
+        import_csv(None, &l, "rvt_diff_l", "rvt_diff_l.csv", 8192).unwrap();
+
+        let r = std::env::temp_dir().join("rvt_diff_r.csv");
+        let mut f = File::create(&r).unwrap();
+        f.write_all(b"id,name\nA,x\nB,q\nD,w\n").unwrap();
+        import_csv(None, &r, "rvt_diff_r", "rvt_diff_r.csv", 8192).unwrap();
+
+        let res = do_diff(
+            None,
+            DiffRequest {
+                left_key: "rvt_diff_l.parquet".to_string(),
+                left_fields: vec!["id".to_string()],
+                right_key: "rvt_diff_r.parquet".to_string(),
+                right_fields: vec!["id".to_string()],
+                output_name: "rvt_diff_out".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(res.same, 1);
+        assert_eq!(res.changed, 1);
+        assert_eq!(res.only_left, 1);
+        assert_eq!(res.only_right, 1);
+
+        let (cols, rows) = read_table_full("rvt_diff_out.parquet").unwrap();
+        assert_eq!(cols, vec!["id", "name", "对比结果", "差异字段"]);
+        assert_eq!(rows.len(), 3);
+        // 左遍历序：B changed、C 仅左；随后 D 仅右
+        assert_eq!(
+            rows[0],
+            vec![
+                json!("B"),
+                json!("y"),
+                json!("有差异"),
+                json!("name")
+            ]
+        );
+        assert_eq!(rows[1][2], json!("仅左表"));
+        assert_eq!(rows[2][2], json!("仅右表"));
+
+        let dd = data_dir().unwrap();
+        for k in ["rvt_diff_l", "rvt_diff_r", "rvt_diff_out"] {
+            let _ = std::fs::remove_file(dd.join(format!("{k}.parquet")));
+        }
+    }
+
+
+    /// 列规则变换：replace + split（拆出新列）
+    #[test]
+    fn transform_replace_and_split() {
+        let t = std::env::temp_dir().join("rvt_xform_in.csv");
+        let mut f = File::create(&t).unwrap();
+        f.write_all(b"name,code\nAlice,A-1\nBob,B-2\n").unwrap();
+        import_csv(None, &t, "rvt_xform_in", "rvt_xform_in.csv", 8192).unwrap();
+
+        let res = do_transform(
+            None,
+            TransformRequest {
+                key: "rvt_xform_in.parquet".to_string(),
+                ops: vec![
+                    TransformOp {
+                        field: "name".to_string(),
+                        op: "replace".to_string(),
+                        param: "Alice,AL".to_string(),
+                    },
+                    TransformOp {
+                        field: "code".to_string(),
+                        op: "split".to_string(),
+                        param: "-,suffix".to_string(),
+                    },
+                ],
+                output_name: "rvt_xform_out".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(res.rows, 2);
+
+        let (cols, rows) = read_table_full("rvt_xform_out.parquet").unwrap();
+        assert_eq!(cols, vec!["name", "code", "suffix"]);
+        assert_eq!(rows[0], vec![json!("AL"), json!("A"), json!("1")]);
+        assert_eq!(rows[1], vec![json!("Bob"), json!("B"), json!("2")]);
+
+        let dd = data_dir().unwrap();
+        let _ = std::fs::remove_file(dd.join("rvt_xform_in.parquet"));
+        let _ = std::fs::remove_file(dd.join("rvt_xform_out.parquet"));
+    }
+
+    /// 剪贴板文本：tab 分隔自动探测并落盘
+    #[test]
+    fn import_text_detects_tsv() {
+        import_text(None, "a\tb\n1\t2\n3\t4\n", "rvt_clip_in", 8192).unwrap();
+        let (cols, rows) = read_table_full("rvt_clip_in.parquet").unwrap();
+        assert_eq!(cols, vec!["a", "b"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![json!("1"), json!("2")]);
+        let _ = std::fs::remove_file(data_dir().unwrap().join("rvt_clip_in.parquet"));
+    }
+
+    /// 历史：push/list/clear 往返
+    #[test]
+    fn history_roundtrip() {
+        clear_history().unwrap();
+        push_history(HistoryPush {
+            action: "import".to_string(),
+            title: "导入 test.csv".to_string(),
+            detail: "/files/preview?key=test.parquet".to_string(),
+        })
+        .unwrap();
+        let list = list_history();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "导入 test.csv");
+        assert_eq!(list[0].detail, "/files/preview?key=test.parquet");
+        assert!(list[0].time > 0);
+        clear_history().unwrap();
+        assert!(list_history().is_empty());
     }
 }
